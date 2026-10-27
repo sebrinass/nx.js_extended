@@ -1,0 +1,430 @@
+SCTP association creation: keep the verdict and say WHY it failed.
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place: the next `git submodule update` would throw the changes away.  This
+patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it is
+the ninth patch of that series, after 0001-switch-webrtc-fixes,
+0002-no-stdout-log, 0003-h265-depacketizer, 0004-dtls-diagnostics,
+0005-ice-roles-prflx-and-timing, 0006-dtls-fingerprint-and-verify,
+0007-ice-timeout-and-verify-none and 0008-dtls-bio-remb-and-candidate-dedup).
+
+Why
+---
+
+The SCTP association is created right after the DTLS handshake succeeds
+(src/peer_connection.c: the PEER_CONNECTION_CONNECTED branch).  Until now
+the result of that creation was COMPLETELY invisible:
+
+  * sctp_create_association() returned -1 and nothing else -- the errno was
+    set to EINVAL and then swallowed by the caller;
+
+  * the SCTP diagnostic channel (sctp_diag_log(), src/sctp.c) never said
+    anything, because the FUNCTION THAT SWITCHES IT ON
+    (nx_webrtc_backend_init() -> peer_init() -> usrsctp_init_nothreads())
+    was never called at all -- see the outer patch 0041.  The engine's
+    callback also had to strip the "SCTP " prefix (src/sctp.c uses 5
+    characters, peer_connection.c uses "LIBPEER " / 8 characters) and to
+    allow the SCTP categories through its filter -- both are in the outer
+    patch too;
+
+  * peer_connection_loop() dropped the verdict with the stack frame.
+
+The result was a device log that said
+
+    [peer] INFO  peer_connection.c 1093  SCTP create socket
+    [peer] ERROR peer_connection.c 1105  SCTP create socket failed
+
+and NOTHING about why.  The report could not say either.
+
+What
+----
+
+1. src/sctp.h
+   - a new SctpCreateFailReason enum (the stable reason codes) and a
+     `create_fail_reason` field in `struct Sctp`;
+   - the declaration of sctp_create_fail_reason_name().
+
+2. src/sctp.c
+   - every failure path of sctp_create_association() now records WHY it
+     failed: runtime (the usrsctp runtime was never initialised), the
+     allocation, the socket, the bind/connect setup, or a null context;
+   - sctp_create_fail_reason_name() maps the code to a STABLE string
+     ("runtime_not_initialized", "socket_present", "allocation_failed",
+     "socket_failed", "setup_failed", "invalid_context", "none",
+     "unknown") -- the engine puts that string straight into its getStats
+     blob, so it must not change;
+   - the "create_failed ..." diagnostic lines carry the reason too.
+
+3. src/peer_connection.h / src/peer_connection.c
+   - PeerConnection remembers the verdict (attempts, return code, reason)
+     instead of dropping it with the stack frame;
+   - a new accessor peer_connection_get_sctp_create_info() exposes it;
+   - a second accessor peer_connection_get_sctp_out_queued() exposes the
+     depth of the SCTP output ring buffer (0041, cloud review): the queue
+     is what sctp_outgoing_data_cb() fills and what sctp_drain() empties,
+     so "the queue never drains" says "the INIT never left the device" a
+     whole order of magnitude faster than waiting for COMM_UP.
+
+4. src/sctp.c / src/sctp.h
+   - sctp_get_output_queue_count(): the ring buffer depth (0 when there is
+     no association yet).  The ring is SCTP_OUTPUT_PACKETS deep and
+     sctp_outgoing_data_cb() answers EWOULDBLOCK when it is full.
+
+★ Why an ACCESSOR and not three more fields in PeerConnectionDiagnostics:
+the engine compiles against extern/libpeer/build/dist/include/peer_connection.h
+-- the INSTALLED COPY of the header, not the source one -- and that copy is
+only refreshed when libpeer is rebuilt (cmake --install).  A struct that
+grows would make the engine and the archive disagree about the layout
+without anybody noticing.  A new FUNCTION cannot do that: a stale archive
+fails to LINK ("undefined reference to peer_connection_get_sctp_create_info"),
+which is loud and immediate.
+
+★ The reason codes are also the ones the DTLS layer trips over: with
+srtp_init() never called, libsrtp's crypto kernel stays in
+srtp_crypto_kernel_state_insecure, so srtp_crypto_kernel_alloc_cipher()
+refuses with srtp_err_status_init_fail and
+dtls_srtp_key_derivation() returns -1 (src/dtls_srtp.c:512) -- which is
+why dtlsState stayed INIT.  Same root cause, two symptoms.
+
+★ SCTP has no second port: the packets ride inside the DTLS channel that
+was just established (out: sctp_drain() -> dtls_srtp_write(); in:
+sctp_incoming_data() -> usrsctp_conninput()).  local_port/remote_port =
+5000 are the RFC 8841 SCTP-layer ports and are correct -- this patch does
+NOT touch them.
+
+Note for the Switch build
+-------------------------
+
+extern/libpeer/src/CMakeLists.txt compiles the peer target with
+CONFIG_USE_USRSCTP=1 (it is the default in src/config.h too), so the
+usrsctp code paths -- and with them sctp_create_association() -- are the
+ones that are built.
+
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index 1dcd9c2..db123da 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -147,6 +147,10 @@ struct PeerConnection {
+   char dtls_offer_fingerprint_alg[16];
+   char dtls_offer_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
+   int sctp_create_attempted;
++  /* 0041: what happened when the SCTP association was created. */
++  int sctp_create_attempts;
++  int sctp_create_ret;
++  int sctp_create_fail_reason;
+   int completed_udp_packets;
+   int completed_rtcp_packets;
+   int completed_dtls_packets;
+@@ -1100,7 +1104,14 @@ int peer_connection_loop(PeerConnection* pc) {
+           pc->sctp_create_attempted = 1;
+           pc->sctp.userdata = pc;
+           int sctp_ret = sctp_create_association(&pc->sctp, &pc->dtls_srtp);
+-          peer_connection_diag_log("sctp_create_done ret=%d", sctp_ret);
++          /* 0041: keep the verdict.  It used to die with this stack frame --
++           * that is why the device only logged "SCTP create socket failed"
++           * and the report could not say WHY. */
++          pc->sctp_create_attempts++;
++          pc->sctp_create_ret = sctp_ret;
++          pc->sctp_create_fail_reason = pc->sctp.create_fail_reason;
++          peer_connection_diag_log("sctp_create_done ret=%d reason=%s", sctp_ret,
++                                   sctp_create_fail_reason_name(pc->sctp.create_fail_reason));
+           if (sctp_ret != 0) {
+             LOGE("SCTP create socket failed");
+             STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+@@ -1823,6 +1834,34 @@ int peer_connection_get_rtt_ms(PeerConnection* pc) {
+   return ice_rtt_ms >= 0 ? ice_rtt_ms : sctp_get_rtt_ms(&pc->sctp);
+ }
+ 
++/* 0041: the SCTP association creation result.  See the declaration in
++ * peer_connection.h for what the three out parameters mean. */
++int peer_connection_get_sctp_create_info(PeerConnection* pc,
++                                          int* out_attempts,
++                                          int* out_ret,
++                                          const char** out_fail_reason) {
++  if (!pc)
++    return -1;
++
++  if (out_attempts)
++    *out_attempts = pc->sctp_create_attempts;
++  if (out_ret)
++    *out_ret = pc->sctp_create_ret;
++  if (out_fail_reason)
++    *out_fail_reason = pc->sctp_create_attempts > 0
++                           ? sctp_create_fail_reason_name(pc->sctp_create_fail_reason)
++                           : "none";
++  return 0;
++}
++
++/* 0041: the SCTP output ring buffer depth.  See the declaration in
++ * peer_connection.h for how to read it. */
++int peer_connection_get_sctp_out_queued(PeerConnection* pc) {
++  if (!pc)
++    return -1;
++  return sctp_get_output_queue_count(&pc->sctp);
++}
++
+ uint64_t peer_connection_get_ice_tie_breaker(PeerConnection* pc) {
+   if (!pc)
+     return 0;
+diff --git a/src/peer_connection.h b/src/peer_connection.h
+index b4d7bb5..d49938a 100644
+--- a/src/peer_connection.h
++++ b/src/peer_connection.h
+@@ -409,6 +409,48 @@ int peer_connection_get_diagnostics(PeerConnection* pc, PeerConnectionDiagnostic
+ 
+ int peer_connection_get_rtt_ms(PeerConnection* pc);
+ 
++/**
++ * @brief The result of the SCTP association creation (0041).
++ *
++ * WHY: the SCTP association is created right after the DTLS handshake
++ * succeeds, and a failure there used to be COMPLETELY invisible: the
++ * caller only got a -1, the errno was swallowed, and the SCTP diagnostic
++ * channel was never enabled by the engine, so the only thing that reached
++ * the log was "SCTP create socket failed".
++ *
++ * @param pc             the peer connection
++ * @param out_attempts   how often sctp_create_association() was tried
++ *                       (0 = never: the DTLS handshake never completed)
++ * @param out_ret        the return value of the last
++ *                       sctp_create_association(): 0 = ok, -1 = failed
++ * @param out_fail_reason  why it failed, as a STABLE string:
++ *                       "none" | "runtime_not_initialized" | "socket_present"
++ *                       | "allocation_failed" | "socket_failed"
++ *                       | "setup_failed" | "invalid_context" | "unknown"
++ *
++ * Returns 0 on success, -1 when the arguments are unusable.
++ */
++int peer_connection_get_sctp_create_info(PeerConnection* pc,
++                                          int* out_attempts,
++                                          int* out_ret,
++                                          const char** out_fail_reason);
++
++/**
++ * @brief How many SCTP packets are waiting in the output ring buffer (0041).
++ *
++ * This is a LIVE counter (it changes every tick), unlike the frozen verdict
++ * of peer_connection_get_sctp_create_info().
++ *
++ *   0            -> nothing is waiting: either the association was never
++ *                   created, or everything (the INIT included) went out.
++ *   > 0, staying -> the packets are NOT leaving the device: the drain path
++ *                   (sctp_drain() -> dtls_srtp_write()) is broken.  Look for
++ *                   "dtls_write_failed" in the diagnostic log.
++ *
++ * Returns the queue depth, or -1 when the arguments are unusable.
++ */
++int peer_connection_get_sctp_out_queued(PeerConnection* pc);
++
+ /**
+  * @brief The ICE tie-breaker of this session.
+  *
+diff --git a/src/sctp.c b/src/sctp.c
+index 94a3988..d618309 100644
+--- a/src/sctp.c
++++ b/src/sctp.c
+@@ -84,6 +84,29 @@ void sctp_set_diagnostics_enabled(int enabled) {
+   sctp_diagnostics_enabled = enabled != 0;
+ }
+ 
++/* 0041: the stable name of a SctpCreateFailReason.  The engine puts this
++ * string straight into its getStats blob, so it must not change. */
++const char* sctp_create_fail_reason_name(int reason) {
++  switch (reason) {
++    case SCTP_CREATE_FAIL_NONE:
++      return "none";
++    case SCTP_CREATE_FAIL_RUNTIME_NOT_INITIALIZED:
++      return "runtime_not_initialized";
++    case SCTP_CREATE_FAIL_SOCKET_PRESENT:
++      return "socket_present";
++    case SCTP_CREATE_FAIL_ALLOCATION_FAILED:
++      return "allocation_failed";
++    case SCTP_CREATE_FAIL_SOCKET_FAILED:
++      return "socket_failed";
++    case SCTP_CREATE_FAIL_SETUP_FAILED:
++      return "setup_failed";
++    case SCTP_CREATE_FAIL_INVALID_CONTEXT:
++      return "invalid_context";
++    default:
++      return "unknown";
++  }
++}
++
+ static void sctp_diag_log(const char* fmt, ...) {
+   if (!sctp_diagnostics_enabled)
+     return;
+@@ -929,9 +952,20 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
+   if (!sctp || !dtls_srtp || !sctp_runtime_initialized || sctp->sock) {
+     const int initialized = sctp_runtime_initialized;
+     const int socket_present = sctp && sctp->sock != NULL;
++    /* 0041: WHY it failed.  Before this the caller only got a -1 and the
++     * errno was swallowed together with the (never enabled) SCTP diagnostic
++     * channel -- that is why the device only logged "SCTP create socket
++     * failed" and nothing else. */
++    const int reason = (!sctp || !dtls_srtp)
++                           ? SCTP_CREATE_FAIL_INVALID_CONTEXT
++                           : (!initialized ? SCTP_CREATE_FAIL_RUNTIME_NOT_INITIALIZED
++                                           : SCTP_CREATE_FAIL_SOCKET_PRESENT);
++    if (sctp)
++      sctp->create_fail_reason = reason;
+     pthread_mutex_unlock(&sctp_runtime_mutex);
+-    sctp_diag_log("create_failed step=runtime initialized=%d context=%d dtls=%d socket=%d errno=%d",
+-                  initialized, sctp != NULL, dtls_srtp != NULL, socket_present, EINVAL);
++    sctp_diag_log("create_failed step=runtime initialized=%d context=%d dtls=%d socket=%d errno=%d reason=%s",
++                  initialized, sctp != NULL, dtls_srtp != NULL, socket_present, EINVAL,
++                  sctp_create_fail_reason_name(reason));
+     errno = EINVAL;
+     return -1;
+   }
+@@ -942,11 +976,15 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
+     free(sctp->transport);
+     sctp->message_buf = NULL;
+     sctp->transport = NULL;
++    sctp->create_fail_reason = SCTP_CREATE_FAIL_ALLOCATION_FAILED;
+     pthread_mutex_unlock(&sctp_runtime_mutex);
+-    sctp_diag_log("create_failed step=allocation errno=%d", ENOMEM);
++    sctp_diag_log("create_failed step=allocation errno=%d reason=%s",
++                  ENOMEM, sctp_create_fail_reason_name(SCTP_CREATE_FAIL_ALLOCATION_FAILED));
+     errno = ENOMEM;
+     return -1;
+   }
++  /* 0041: a fresh attempt -- the previous reason must not survive. */
++  sctp->create_fail_reason = SCTP_CREATE_FAIL_NONE;
+   sctp->message_len = 0;
+   sctp->receive_failed = 0;
+   sctp->closing = 0;
+@@ -967,7 +1005,9 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
+ 
+   if (!sock) {
+     const int socket_errno = errno;
+-    sctp_diag_log("create_failed step=socket errno=%d", socket_errno);
++    sctp->create_fail_reason = SCTP_CREATE_FAIL_SOCKET_FAILED;
++    sctp_diag_log("create_failed step=socket errno=%d reason=%s", socket_errno,
++                  sctp_create_fail_reason_name(SCTP_CREATE_FAIL_SOCKET_FAILED));
+     LOGE("usrsctp_socket failed");
+     usrsctp_deregister_address(sctp);
+     free(sctp->message_buf);
+@@ -1091,9 +1131,12 @@ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp) {
+   } while (0);
+ 
+   const int setup_errno = errno;
++  if (ret < 0)
++    sctp->create_fail_reason = SCTP_CREATE_FAIL_SETUP_FAILED;
+   pthread_mutex_unlock(&sctp_runtime_mutex);
+   if (ret < 0) {
+-    sctp_diag_log("create_failed step=%s errno=%d", setup_step, setup_errno);
++    sctp_diag_log("create_failed step=%s errno=%d reason=%s", setup_step, setup_errno,
++                  sctp_create_fail_reason_name(SCTP_CREATE_FAIL_SETUP_FAILED));
+     sctp_destroy_association(sctp);
+     errno = setup_errno;
+     return -1;
+@@ -1174,7 +1217,6 @@ int sctp_get_rtt_ms(Sctp* sctp) {
+ #if CONFIG_USE_USRSCTP
+   if (!sctp || !sctp->sock || !sctp->connected)
+     return -1;
+-
+   struct sctp_status status;
+   socklen_t status_len = sizeof(status);
+   memset(&status, 0, sizeof(status));
+@@ -1200,6 +1242,29 @@ void sctp_onmessage(Sctp* sctp, void (*onmessage)(char* msg, size_t len, void* u
+   sctp->onmessage = onmessage;
+ }
+ 
++/* 0041: how many SCTP packets are still sitting in the output ring buffer.
++ *
++ * WHY: sctp_outgoing_data_cb() can only ENQUEUE -- it runs inside usrsctp
++ * and has no way to write to the DTLS channel -- and sctp_drain() is what
++ * actually writes them out.  A queue that never drains means the INIT never
++ * left the device: a far sharper symptom than "the association never
++ * reached COMM_UP".
++ *
++ * The ring is SCTP_OUTPUT_PACKETS deep and sctp_outgoing_data_cb() answers
++ * EWOULDBLOCK when it is full -- so a permanently non-empty queue also means
++ * the drain path is broken.
++ */
++int sctp_get_output_queue_count(Sctp* sctp) {
++#if CONFIG_USE_USRSCTP
++  if (!sctp || !sctp->transport)
++    return 0;
++  return (int)sctp->transport->output_count;
++#else
++  (void)sctp;
++  return 0;
++#endif
++}
++
+ void sctp_onopen(Sctp* sctp, void (*onopen)(void* userdata)) {
+   sctp->onopen = onopen;
+ }
+diff --git a/src/sctp.h b/src/sctp.h
+index f2c21dd..dc3d81d 100644
+--- a/src/sctp.h
++++ b/src/sctp.h
+@@ -153,12 +153,43 @@ typedef struct {
+   int ack_pending;
+ } SctpStreamEntry;
+ 
++/**
++ * @brief Why sctp_create_association() failed (0041).
++ *
++ * Before 0041 the ONLY thing the caller got was a -1 and a errno, and the
++ * errno was swallowed by the diagnostic channel (the SCTP channel was never
++ * enabled), so the real device logged nothing but "SCTP create socket
++ * failed".
++ *
++ * The values are stable.  sctp_create_fail_reason_name() turns them into
++ * the strings the engine reports in getStats:
++ *
++ *   "none"                    -- no failure (never tried, or it worked)
++ *   "runtime_not_initialized" -- sctp_usrsctp_init() never ran
++ *   "socket_present"          -- the association already has a socket
++ *   "allocation_failed"       -- out of memory
++ *   "socket_failed"           -- usrsctp_socket() failed
++ *   "setup_failed"            -- bind/connect/nonblocking setup failed
++ *   "invalid_context"         -- the caller passed a null sctp/dtls_srtp
++ */
++typedef enum SctpCreateFailReason {
++  SCTP_CREATE_FAIL_NONE = 0,
++  SCTP_CREATE_FAIL_RUNTIME_NOT_INITIALIZED = 1,
++  SCTP_CREATE_FAIL_SOCKET_PRESENT = 2,
++  SCTP_CREATE_FAIL_ALLOCATION_FAILED = 3,
++  SCTP_CREATE_FAIL_SOCKET_FAILED = 4,
++  SCTP_CREATE_FAIL_SETUP_FAILED = 5,
++  SCTP_CREATE_FAIL_INVALID_CONTEXT = 6,
++} SctpCreateFailReason;
++
+ typedef struct Sctp {
+   struct socket* sock;
+ 
+   int local_port;
+   int remote_port;
+   int connected;
++  /* 0041: the reason of the LAST sctp_create_association() failure. */
++  int create_fail_reason;
+   uint32_t verification_tag;
+   uint32_t tsn;
+   uint32_t last_outbound_tsn;
+@@ -191,6 +222,22 @@ typedef struct Sctp {
+ 
+ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp);
+ 
++/* 0041: the stable name of a SctpCreateFailReason. */
++const char* sctp_create_fail_reason_name(int reason);
++
++/**
++ * @brief How many SCTP packets are still sitting in the output ring buffer.
++ *
++ * WHY (0041): sctp_outgoing_data_cb() can only ENQUEUE -- it runs inside
++ * usrsctp and has no way to write to the DTLS channel -- and sctp_drain()
++ * is what actually writes them out.  A queue that never drains means the
++ * INIT never left the device, which is a far sharper symptom than "the
++ * association never reached COMM_UP".
++ *
++ * Returns the queue depth (0 when there is no association yet).
++ */
++int sctp_get_output_queue_count(Sctp* sctp);
++
+ void sctp_set_diagnostics_enabled(int enabled);
+ void sctp_set_diagnostic_callback(void (*callback)(const char*));
+ 

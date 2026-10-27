@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# GNU Make 4.4 shim for the Switch cross-build of libpeer (Windows only).
+#
+# Problem
+# -------
+# CMake's "Unix Makefiles" generator writes a target's compiler dependency
+# list to compiler_depend.make.  For a target that is defined in a
+# sub-directory of the project (usrsctp's "usrsctplib/" target) CMake emits
+# out-of-tree dependency paths with the sub-directory glued in front of the
+# Windows drive letter:
+#
+#     usrsctplib/C:/devkitPro/devkitA64/aarch64-none-elf/include/errno.h
+#
+# GNU Make 4.4 parses such a line as a *pattern rule* ("usrsctplib/C" looks
+# like a target pattern) and aborts the whole build with:
+#
+#     compiler_depend.make:4: *** multiple target patterns.  Stop.
+#
+# Minimal reproduction (GNU Make 4.4.1, MSYS2):
+#
+#     all:
+#     	@echo OK
+#
+#     foo.o: /tmp/a.c \
+#       sub/C:/tmp/b.h        <-- aborts with "multiple target patterns"
+#
+#     foo.o: /tmp/a.c \
+#       C:/tmp/b.h            <-- fine
+#
+# CMake emits the plain "C:/devkitPro/..." form for targets at the top level
+# of a project, and GNU Make parses that form correctly, so the fix is simply
+# to drop the spurious "<dir>/" prefix in front of the drive letter.
+#
+# What this shim does
+# -------------------
+# Before handing over to the real make, it rewrites every
+# compiler_depend.make in the current build tree:
+#
+#     <dir>/<Drive>:/...   ->   <Drive>:/...
+#
+# The rewrite is a no-op for files that do not contain the broken form.
+#
+# The "depend" target that regenerates compiler_depend.make is .PHONY, i.e.
+# it runs on every build and re-introduces the broken paths.  Fixing the file
+# only after the build would therefore not be enough -- hence this shim runs
+# before *every* make invocation, which is exactly when make parses the
+# dependency file.
+#
+# On a POSIX builder the problem does not exist; tools/build-libpeer.sh only
+# puts this directory on PATH when the shim exists, so the build stays
+# portable.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+SHIM_PATH="$0"
+
+# The real make.  LIBPEER_REAL_MAKE wins; otherwise probe the usual spots.
+# "command -v make" cannot be used here: the shim itself is called "make"
+# and is first on PATH.
+REAL_MAKE="${LIBPEER_REAL_MAKE:-}"
+if [ -z "${REAL_MAKE}" ]; then
+	for candidate in \
+		"/c/devkitPro/msys2/usr/bin/make.exe" \
+		"/usr/bin/make" \
+		"/usr/bin/gmake" \
+		"/mingw64/bin/make.exe"
+	do
+		if [ -x "${candidate}" ]; then
+			REAL_MAKE="${candidate}"
+			break
+		fi
+	done
+fi
+if [ -z "${REAL_MAKE}" ]; then
+	echo "error: real make not found (set LIBPEER_REAL_MAKE)" >&2
+	exit 1
+fi
+
+fix_depfiles() {
+	local f
+	while IFS= read -r -d '' f; do
+		[ -f "$f" ] || continue
+		# Only touch files that actually contain the broken shape.
+		if grep -qE '(^|[[:space:]])[A-Za-z0-9_.-]+/[A-Za-z]:/' "$f" 2>/dev/null; then
+			sed -i -E 's#(^|[[:space:]])[A-Za-z0-9_.-]+/([A-Za-z]:/)#\1\2#g' "$f"
+			echo "make-shim: rewrote drive-letter dependency paths in ${f}" >&2
+		fi
+	done < <(find . -name compiler_depend.make -type f -print0 2>/dev/null)
+}
+
+fix_depfiles
+
+# CMake's generated makefiles recurse via "$(MAKE)".  GNU Make sets $(MAKE)
+# from argv[0], so exec'ing the real make under the shim's own name makes
+# every recursive invocation go through the shim as well.  That matters
+# because the "depend" step regenerates compiler_depend.make *during* the
+# build; the next recursive make has to fix it again before it parses it.
+exec -a "${SHIM_PATH}" "${REAL_MAKE}" "$@"

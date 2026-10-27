@@ -1,6 +1,7 @@
 #include "crypto.h"
 #include "async.h"
 #include "error.h"
+#include "nx_entropy.h"
 #include "util.h"
 #include "wrap.h"
 #include <errno.h>
@@ -429,7 +430,9 @@ void nx_crypto_encrypt_do(nx_work_t *req) {
 		mbedtls_ctr_drbg_context oaep_ctr_drbg;
 		mbedtls_entropy_init(&oaep_entropy);
 		mbedtls_ctr_drbg_init(&oaep_ctr_drbg);
-		int ret = mbedtls_ctr_drbg_seed(&oaep_ctr_drbg, mbedtls_entropy_func,
+		// The Switch has no /dev/urandom, so mbedtls' platform entropy
+		// source cannot work: feed the DRBG from libnx' randomGet() instead.
+		int ret = mbedtls_ctr_drbg_seed(&oaep_ctr_drbg, nx_mbedtls_entropy_func,
 		                                &oaep_entropy, NULL, 0);
 		if (ret != 0) {
 			mbedtls_ctr_drbg_free(&oaep_ctr_drbg);

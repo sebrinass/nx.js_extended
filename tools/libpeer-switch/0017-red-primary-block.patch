@@ -1,0 +1,192 @@
+RED audio: hand the opus decoder the primary block, not the whole data area.
+
+0016 stripped the fixed five byte RED wrapper and then passed payload+5 .. end
+to opus.  That slice starts with the **redundant block's payload**, not with
+the primary block -- RFC 2198 lays the data area out as
+[redundant1][redundant2]...[primary].  So the decoder kept receiving
+"redundant + primary" glued together as a single frame:
+
+  payload                        hdr  block1  primary   0016 gave  correct
+  ef 0f 00 03 6f fc ff fe fc..   (5)   (3)      (3)        6         3
+  ef 0f 00 a1 6f fc ..           (5)   (161)    (161)      322       161
+  ef 0f 01 0b 6f fc ..           (5)   (267)    (215)      482       215
+  ef 0f 00 d7 6f fc ..           (5)   (215)    (161)      376       161
+
+CELT allows a 20 ms frame up to 1275 bytes, so opus never complained: it took
+322 bytes as one frame and decoded it.  Frame counts, duration and loss
+statistics all looked right -- only the content was wrong: the amplitude shot
+to 1.38 and audio-graph's clampf(-1, 1) chopped it into a square wave.  On the
+console that is "a cave, with the melody barely audible", while every counter
+says "decoding is fine, errors=1".
+
+What
+----
+  * rtp_red5_strip() becomes a real RFC 2198 chain walk: consume the block
+    header area (an F=1 block is 4 bytes -- 14 bit timestamp offset + 10 bit
+    length; the F=0 block is the primary, one header byte), sum the redundant
+    lengths, and start the primary at hdr + sum(length).
+  * Only payload type 63 is touched.  0016 keyed on payload[0] == 0xef, but a
+    bare opus TOC (0xfc) has the F bit set too -- a wrong guess cuts a good
+    packet in half.  pt != 63 now passes through byte for byte, so the bare
+    opus path is exactly what it was before 0016.
+  * A redundant block must be PT 111 (opus) and there may be at most 4 of
+    them; anything else is forwarded untouched.  An unrecognised shape keeps
+    the old "cannot decode" behaviour; mangling a packet that does decode is
+    not acceptable.
+  * The primary TOC is still shape-checked (frame count code 3 requires a
+    following count byte holding 1..3).
+  * The diagnostic prints the payload type: "[red5] pt=%d in=%d out=%d stripped=%d".
+
+The redundant block is genuinely useful -- it is a free retransmit of the
+previous 20 ms -- but using it needs a jitter buffer and a "this sequence
+number really did not arrive" verdict.  That is 0018; nothing is guessed here.
+
+Patch 0017 of the libpeer-switch series, applied after 0016-red-audio-depacket.patch
+by tools/apply-libpeer-switch-patches.sh.
+
+
+--- a/src/rtp.c
++++ b/src/rtp.c
+@@ -1078,29 +1078,87 @@
+ // fallback guess.  A packet that does not match every byte is forwarded
+ // untouched -- "cannot decode" is the old behaviour, corrupting a packet that
+ // does decode is not acceptable.
+ static int rtp_red5_reports = 0;
+-
+-static int rtp_red5_strip(uint8_t* payload, size_t size, uint8_t** out_payload, size_t* out_size) {
++// 0017: 前三个包的一次性样本可能全是裸 opus（pt 111），那样就看不到 RED 的
++// 处理结果了。这两个累计量每 200 个 RED 包打一行，保证日志里一定有 RED 的
++// 「进来多少 / 剥掉多少 / 原样放行多少」，也能顺手暴露「剥不动」的形状。
++static int rtp_red5_red_total = 0;
++static int rtp_red5_red_stripped = 0;
++static int rtp_red5_red_kept = 0;
++
++// 0017: 0016 剥对了「头」，但交错了「数据」。
++//
++// 0016 剥掉固定 5 字节后把 payload+5 .. end 整段交给了 opus。那一段并不是
++// primary block —— RFC 2198 的数据区是 [冗余块1][冗余块2]...[primary]，所以
++// payload+5 里前 L 个字节是**上一个 20ms 的重传**，primary 排在它后面。
++// 12 个真机包对账（payload type 63 = RED）：
++//
++//   payload                        hdr  block1  primary   0016 交出  正确
++//   ef 0f 00 03 6f fc ff fe fc..   (5)   (3)      (3)        6        3
++//   ef 0f 00 a1 6f fc ..           (5)   (161)    (161)      322      161
++//   ef 0f 01 0b 6f fc ..           (5)   (267)    (215)      482      215
++//   ef 0f 00 d7 6f fc ..           (5)   (215)    (161)      376      161
++//
++// opus 收到 322 字节就按 TOC 把 322 字节当**一帧**解（CELT 20ms 单帧允许到
++// 1275 字节，所以它不报错），解出来的东西是失真的：幅度冲到 1.38 被
++// audio-graph 的 clampf(-1,1) 削成方波，听感就是「洞穴里的破音 + 勉强能听出
++// 旋律」。帧数、时长全对，所以统计上一直像「解码没问题」。
++//
++// 正确的切法：block1 的长度在那 24 bit 的低 10 bit 里
++// （payload[2] 的低 2 位 + payload[3]），primary 从 hdr+block1_len 开始。
++//
++// 冗余块本身是有用的（它就是丢包的免费重传），但要拿它得先有 jitter buffer
++// 和「这个序列号真的没到」的判定 —— 那是 0018 的事。这里只保证交出对的
++// primary，不猜、不拼。
++static int rtp_red5_strip(uint8_t pt, uint8_t* payload, size_t size, uint8_t** out_payload,
++                          size_t* out_size) {
+   if (payload == NULL || out_payload == NULL || out_size == NULL)
+     return 0;
+-  // Five bytes of wrapper plus a TOC and at least two bytes of frame.
+-  if (size < 8)
++  // 0017: 只有 SDP 协商成 RED 的包才允许动。0016 只看 payload[0]，而裸 opus
++  // 的 TOC（0xfc）最高位也是 1 —— 猜错就会把一个好包从中间劈开。
++  if (pt != 63)
+     return 0;
+-  if (payload[0] != 0xef || payload[1] != 0x0f || payload[4] != 0x6f)
++  // 至少一个 primary 头 + 一个数据字节。
++  if (size < 6)
+     return 0;
+ 
+-  // What would become the TOC still has to look like one.  config (5 bits) and
+-  // stereo are free -- any value is a legal configuration -- but the frame
+-  // count code in the low two bits is not: code 3 means "the count is in the
+-  // next byte", so that byte has to be there and hold a count of 1..3.
+-  if ((payload[5] & 0x03) == 0x03) {
+-    if (size < 9 || payload[6] == 0 || (payload[6] & 0x3f) > 3)
++  // 走完 block header 区：F=1 的块占 4 字节（offset 14 bit + length 10 bit），
++  // F=0 的是 primary，只占 1 字节，数据排在最后。
++  size_t pos = 0;
++  size_t redundant_bytes = 0;
++  int redundant_blocks = 0;
++  while (pos < size) {
++    const uint8_t b = payload[pos];
++    if ((b & 0x80) != 0) {
++      if (pos + 4 > size)
++        return 0;
++      if ((b & 0x7f) != 111)
++        return 0;  // 冗余块必须是 opus，否则形状不认识，原样放行
++      redundant_bytes +=
++          (((size_t)(payload[pos + 2] & 0x03)) << 8) | (size_t)payload[pos + 3];
++      pos += 4;
++      if (++redundant_blocks > 4)
++        return 0;
++    } else {
++      if ((b & 0x7f) != 111)
++        return 0;
++      pos += 1;
++      break;
++    }
++  }
++
++  // ★ 0017 的全部关键：primary 在「header 区 + 所有冗余数据」之后。
++  if (pos + redundant_bytes >= size)
++    return 0;
++  *out_payload = payload + pos + redundant_bytes;
++  *out_size = size - pos - redundant_bytes;
++
++  // 拿出来的东西还得像个 opus 包：帧数 code 3 要求后续计数字节是 1..3。
++  if (((*out_payload)[0] & 0x03) == 0x03) {
++    if (*out_size < 2 || (*out_payload)[1] == 0 || ((*out_payload)[1] & 0x3f) > 3)
+       return 0;
+   }
+-
+-  *out_payload = payload + 5;
+-  *out_size = size - 5;
+   return 1;
+ }
+ 
+ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+@@ -1128,20 +1186,36 @@
+       rtp_decoder->audio_opus_packets++;
+     }
+   }
+ 
+-  // 0016: the opus decoder has to see the bare frame, not the RED wrapper.
++  // 0016/0017: the opus decoder has to see the bare frame, not the RED wrapper.
+   // Stripped or not, both callbacks below get this pair -- the packet is never
+   // dropped and never half-rewritten.
+   uint8_t* audio_payload = view.payload;
+   size_t audio_size = view.payload_size;
+-  const int stripped = rtp_red5_strip(view.payload, view.payload_size, &audio_payload, &audio_size);
++  const uint8_t audio_pt = (buf != NULL) ? ((RtpHeader*)buf)->type : 0xff;
++  const int stripped = rtp_red5_strip(audio_pt, view.payload, view.payload_size, &audio_payload,
++                                      &audio_size);
+   // One-shot proof for the first three packets: stderr, never stdout -- libnx
+   // binds stdout to the console renderer, see the note in src/utils.h.
+   if (rtp_red5_reports < 3) {
+     rtp_red5_reports++;
+-    fprintf(stderr, "[red5] in=%d out=%d stripped=%d\n", (int)view.payload_size,
+-            (int)audio_size, stripped);
++    fprintf(stderr, "[red5] pt=%d in=%d out=%d stripped=%d\n", (int)audio_pt,
++            (int)view.payload_size, (int)audio_size, stripped);
++  }
++  // 0017: rolling verdict -- 每 200 个 RED 包一行，前三个样本落在裸 opus 上
++  // 也照样能判断剥离有没有生效。last in/out 是最近一次的实测量。
++  if (audio_pt == 63) {
++    rtp_red5_red_total++;
++    if (stripped)
++      rtp_red5_red_stripped++;
++    else
++      rtp_red5_red_kept++;
++    if ((rtp_red5_red_total % 200) == 0) {
++      fprintf(stderr, "[red5] red total=%d stripped=%d kept=%d last in=%d out=%d\n",
++              rtp_red5_red_total, rtp_red5_red_stripped, rtp_red5_red_kept,
++              (int)view.payload_size, (int)audio_size);
++    }
+   }
+ 
+   if (rtp_decoder->on_audio_packet != NULL) {
+     PeerAudioPacket packet = {

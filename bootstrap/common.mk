@@ -43,14 +43,17 @@ RUNTIME_PKG := $(COMMON_DIR)/../packages/runtime/package.json
 APP_TITLE   ?=  nx.js app
 APP_AUTHOR  ?=  TooTallNate
 APP_TITLEID ?=  016e782e6a730000
-APP_VERSION :=  `jq -r .version < $(RUNTIME_PKG)`
+# ?= (not :=) so a launcher that ships its own NACP metadata (e.g. the brewser
+# launcher, which must look exactly like the shell it replaces) can set these
+# without needing jq / packages/runtime/package.json at build time.
+APP_VERSION ?=  `jq -r .version < $(RUNTIME_PKG)`
 # Default [runtime] version requirement baked into the launcher: caret on the
 # FULL runtime version this launcher was built against (e.g. ^1.0.0-beta.2),
 # i.e. "at least the version packaged with, or any newer compatible release".
 # A caret-on-major (^1) would wrongly accept an OLDER runtime that lacks
 # features the app expects. This is only the fallback for a hand-built app whose
 # nxjs.ini has no [runtime] version; @nx.js/nro and @nx.js/nsp inject their own.
-NXJS_RUNTIME_DEFAULT := ^$(shell jq -r .version < $(RUNTIME_PKG))
+NXJS_RUNTIME_DEFAULT ?= ^$(shell jq -r .version < $(RUNTIME_PKG))
 
 # The devkitPro %.nacp rule passes APP_TITLEID only via NACPFLAGS (not as a
 # positional arg), so wire it through like the root Makefile does. This bakes
@@ -65,6 +68,11 @@ BUILD		:=	build
 # Each launcher's own source/ plus the shared bootstrap/source (+ vendor).
 SOURCES		+=	source $(COMMON_DIR)/source $(COMMON_DIR)/source/vendor
 INCLUDES	+=	source $(COMMON_DIR)/source
+
+# Launchers that don't need the shared download/UI/resolve machinery (the
+# brewser launcher only uses the pure semver matcher) exclude those .c files
+# from the link so the NRO stays ~200 KB instead of dragging in ssl/nifm/romfs.
+BOOTSTRAP_EXCLUDE_C ?=
 
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a+crc+crypto -mtune=cortex-a57 -mtp=soft -fPIE
@@ -93,7 +101,7 @@ export VPATH	:=	$(foreach dir,$(SOURCES),$(if $(filter /%,$(dir)),$(dir),$(CURDI
 
 export DEPSDIR	:=	$(CURDIR)/$(BUILD)
 
-CFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c)))
+CFILES		:=	$(filter-out $(BOOTSTRAP_EXCLUDE_C),$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.c))))
 CPPFILES	:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.cpp)))
 SFILES		:=	$(foreach dir,$(SOURCES),$(notdir $(wildcard $(dir)/*.s)))
 

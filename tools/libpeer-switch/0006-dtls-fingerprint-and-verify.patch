@@ -1,0 +1,342 @@
+DTLS fingerprint comparison and certificate verification for libpeer (extern/libpeer).
+
+extern/libpeer is a git SUBMODULE, so its sources are not edited in place:
+the next `git submodule update` would throw the changes away.  The fixes
+therefore live as a patch file next to the script (tools/libpeer-switch/
+*.patch) and are applied to the checked out tree right before libpeer is
+built.  That keeps the engine patch self contained: one patch file for the
+engine, one patch file for the submodule.
+
+This is the sixth patch of that series.  It is applied AFTER
+0001-switch-webrtc-fixes, 0002-no-stdout-log, 0003-h265-depacketizer,
+0004-dtls-diagnostics and 0005-ice-roles-prflx-and-timing.
+
+Why
+---
+The DTLS handshake completes and then libpeer throws the peer away because
+the certificate does not "match" the fingerprint the offer announced:
+
+  * The fingerprint was compared as a STRING (strncmp() in
+    dtls_srtp_handshake()).  libwebrtc prints a fingerprint in UPPER case
+    hex (SSLFingerprint::GetRfc4572Fingerprint() hex encodes the digest and
+    upper cases it) and it compares the DIGEST BYTES
+    (SSLFingerprint::operator==), not the printed string.  A peer that
+    prints its fingerprint in lower case therefore never matched: the
+    handshake succeeded and the correct certificate was rejected right
+    after it.
+
+  * The certificate verification was stricter than the official client
+    (BoringSSL with SSL_VERIFY_PEER and its own verify callback).  The
+    official client only checks the fingerprint digest that the SDP
+    announced -- it does NOT check the CA chain and it does NOT check the
+    validity period.  libpeer cleared NOT_TRUSTED / CN_MISMATCH / BAD_KEY
+    but NOT BADCERT_EXPIRED / BADCERT_FUTURE, so a clock that is a little
+    off on the Switch broke the handshake.
+
+What it changes
+---------------
+1. src/dtls_srtp.c -- the fingerprint is compared on its BYTES:
+
+     dtls_srtp_x509_digest_bytes()    the SHA-256 digest of the certificate
+                                      as 32 raw bytes
+     dtls_srtp_x509_digest()          the same digest, printed (unchanged)
+     dtls_srtp_fingerprint_to_bytes() "AB:CD:EF:..." -> 32 raw bytes
+     dtls_srtp_bytes_equal()          constant time comparison
+     dtls_srtp_fingerprint_matches()  the verdict (1 / 0 / -1)
+
+   The decoder takes the value the way the peer may print it: upper case or
+   lower case hex, ":" or no separator, with or without the algorithm token
+   ("sha-256 ").  A value that cannot be parsed -- a wrong length, a stray
+   character, a dangling half byte -- is a MISMATCH and is logged; it is
+   never silently accepted.
+
+   The verdict semantics of 0035 are unchanged: fingerprint_check is 1 when
+   the fingerprints match, -1 when they do not match (or cannot be parsed)
+   and -2 when the peer sent no certificate at all.
+
+2. src/dtls_srtp.c -- the verify callback (dtls_srtp_cert_verify()) clears
+   two more flags:
+
+     MBEDTLS_X509_BADCERT_EXPIRED   the certificate is not valid any more
+     MBEDTLS_X509_BADCERT_FUTURE    the certificate is not valid yet
+
+   Both are behind #ifdef: MBEDTLS_X509_BADCERT_FUTURE does not exist in
+   mbedTLS 2.x (the tree is built against 3.4.0, but config.h still has the
+   CONFIG_MBEDTLS_2_X branch), so the macro is used only when the header
+   defines it.
+
+   The alternative -- MBEDTLS_SSL_VERIFY_NONE -- is NOT used here: it would
+   switch the certificate verification off COMPLETELY and leave the SDP
+   fingerprint as the only guard.  Clearing the two flags keeps the
+   verification in place and is the smaller, reversible change.
+
+3. src/config.h -- NOT touched: the DTLS certificate is an ECDSA P-256 key
+   already.  0005-ice-roles-prflx-and-timing.patch sets
+   CONFIG_DTLS_USE_ECDSA to 1 and checks the errors of mbedtls_pk_setup() /
+   mbedtls_ecp_gen_key(), so this patch does not repeat that work.
+
+No key material is logged or exported by this patch.
+diff --git a/src/dtls_srtp.c b/src/dtls_srtp.c
+index 73cbf58..ff6a956 100644
+--- a/src/dtls_srtp.c
++++ b/src/dtls_srtp.c
+@@ -45,16 +45,26 @@ int dtls_srtp_udp_recv(void* ctx, uint8_t* buf, size_t len) {
+   return ret;
+ }
+
+-static void dtls_srtp_x509_digest(const mbedtls_x509_crt* crt, char* buf) {
+-  int i;
+-  unsigned char digest[32];
+-
++// 0006: the SHA-256 digest of the certificate as RAW BYTES.
++//
++// libwebrtc compares the digest BYTES (SSLFingerprint::operator== compares
++// the digest, not the printed string), so the digest is needed in this form
++// as well: the printable form is only good for the log and for the SDP.
++static void dtls_srtp_x509_digest_bytes(const mbedtls_x509_crt* crt, unsigned char digest[32]) {
+   mbedtls_sha256_context sha256_ctx;
++
+   mbedtls_sha256_init(&sha256_ctx);
+   mbedtls_sha256_starts(&sha256_ctx, 0);
+   mbedtls_sha256_update(&sha256_ctx, crt->raw.p, crt->raw.len);
+-  mbedtls_sha256_finish(&sha256_ctx, (unsigned char*)digest);
++  mbedtls_sha256_finish(&sha256_ctx, digest);
+   mbedtls_sha256_free(&sha256_ctx);
++}
++
++static void dtls_srtp_x509_digest(const mbedtls_x509_crt* crt, char* buf) {
++  int i;
++  unsigned char digest[32];
++
++  dtls_srtp_x509_digest_bytes(crt, digest);
+
+   for (i = 0; i < 32; i++) {
+     snprintf(buf, 4, "%.2X:", digest[i]);
+@@ -65,8 +75,26 @@ static void dtls_srtp_x509_digest(const mbedtls_x509_crt* crt, char* buf) {
+ }
+
+ // Do not verify CA
++//
++// 0006: the official native client (BoringSSL with SSL_VERIFY_PEER and its
++// own verify callback) does NOT check the CA chain and it does NOT check the
++// validity period -- it only checks the fingerprint digest that the SDP
++// announced.  The clock of the Switch is not always in sync with the clock
++// of the cloud, so a certificate that is not valid YET (or not valid ANY
++// MORE) must not break the handshake.
++//
++// The flags are cleared, the verification itself stays on: the alternative
++// (MBEDTLS_SSL_VERIFY_NONE) would switch the certificate verification off
++// COMPLETELY and leave the fingerprint as the only guard -- that is a bigger
++// change and it is not needed here.
+ static int dtls_srtp_cert_verify(void* data, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
+   *flags &= ~(MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_BAD_KEY);
++#ifdef MBEDTLS_X509_BADCERT_EXPIRED
++  *flags &= ~(uint32_t)MBEDTLS_X509_BADCERT_EXPIRED;
++#endif
++#ifdef MBEDTLS_X509_BADCERT_FUTURE
++  *flags &= ~(uint32_t)MBEDTLS_X509_BADCERT_FUTURE;
++#endif
+   return 0;
+ }
+
+@@ -476,6 +504,147 @@ static void dtls_srtp_fingerprint_summary(const char* fingerprint, char* out, si
+   out[i] = '\0';
+ }
+
++// 0006: is this a hex digit?
++static int dtls_srtp_is_hex_digit(char c) {
++  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
++}
++
++// 0006: the value of a hex digit.
++static unsigned char dtls_srtp_hex_value(char c) {
++  if (c >= '0' && c <= '9') {
++    return (unsigned char)(c - '0');
++  }
++  if (c >= 'a' && c <= 'f') {
++    return (unsigned char)(c - 'a' + 10);
++  }
++  return (unsigned char)(c - 'A' + 10);
++}
++
++// 0006: the hex value of a fingerprint ("AB:CD:EF:...") as RAW BYTES.
++//
++// The peer may print the fingerprint in upper case (that is what libwebrtc
++// does -- SSLFingerprint::GetRfc4572Fingerprint() hex encodes the digest
++// and upper cases it) or in lower case, and it may or may not use ":" as the
++// separator.  The comparison therefore happens on the BYTES and never on the
++// strings.
++//
++// The value may also carry its algorithm ("sha-256 AB:CD:..."); the
++// algorithm token is skipped when it is not a hex string (so a fingerprint
++// that is written without a separator does not lose its first byte).
++//
++// Returns 0 on success and -1 when the value is not a well formed
++// fingerprint of the expected length.  A value that cannot be parsed is a
++// MISMATCH -- it is never silently accepted.
++static int dtls_srtp_fingerprint_to_bytes(const char* value, size_t value_len, unsigned char* out, size_t out_len) {
++  size_t i = 0;
++  size_t bytes = 0;
++  int high = -1;
++
++  if (!value || !out || out_len == 0) {
++    return -1;
++  }
++
++  // Skip the leading white space.
++  while (i < value_len && (value[i] == ' ' || value[i] == '\t')) {
++    i++;
++  }
++
++  // Skip the algorithm token ("sha-256"), but only when it is NOT a hex
++  // string.
++  {
++    size_t j = i;
++    while (j < value_len && value[j] != ' ' && value[j] != '\t') {
++      j++;
++    }
++    if (j > i && j < value_len) {
++      int all_hex = 1;
++      size_t k;
++      for (k = i; k < j; k++) {
++        if (!dtls_srtp_is_hex_digit(value[k])) {
++          all_hex = 0;
++          break;
++        }
++      }
++      if (!all_hex) {
++        i = j + 1;
++        while (i < value_len && (value[i] == ' ' || value[i] == '\t')) {
++          i++;
++        }
++      }
++    }
++  }
++
++  for (; i < value_len; i++) {
++    char c = value[i];
++
++    if (c == ':' || c == ' ' || c == '\t' || c == '\r' || c == '\n') {
++      // A separator is only allowed BETWEEN two bytes.
++      if (high >= 0) {
++        return -1;
++      }
++      continue;
++    }
++
++    if (!dtls_srtp_is_hex_digit(c)) {
++      return -1;
++    }
++
++    if (high < 0) {
++      high = dtls_srtp_hex_value(c);
++    } else {
++      if (bytes >= out_len) {
++        return -1;
++      }
++      out[bytes] = (unsigned char)((high << 4) | dtls_srtp_hex_value(c));
++      bytes++;
++      high = -1;
++    }
++  }
++
++  // A dangling half byte and a wrong length are both a mismatch.
++  if (high >= 0 || bytes != out_len) {
++    return -1;
++  }
++
++  return 0;
++}
++
++// 0006: compare two byte strings in constant time.
++static int dtls_srtp_bytes_equal(const unsigned char* a, const unsigned char* b, size_t len) {
++  unsigned char diff = 0;
++  size_t i;
++
++  for (i = 0; i < len; i++) {
++    diff |= (unsigned char)(a[i] ^ b[i]);
++  }
++
++  return diff == 0;
++}
++
++// 0006: does the fingerprint the peer announced in its SDP belong to the
++// certificate the peer actually presented?
++//
++// libwebrtc compares the digest BYTES, so the case of the hex digits and
++// the separators of the announced value do not matter.  The old code
++// compared the two STRINGS, which turned a fingerprint printed in lower
++// case into a mismatch.
++//
++// Returns 1 when they match, 0 when they do not match and -1 when the
++// announced fingerprint could not be parsed at all.
++static int dtls_srtp_fingerprint_matches(const char* announced, size_t announced_len, const unsigned char* digest) {
++  unsigned char expected[32];
++
++  if (!digest) {
++    return -1;
++  }
++
++  if (dtls_srtp_fingerprint_to_bytes(announced, announced_len, expected, sizeof(expected)) != 0) {
++    return -1;
++  }
++
++  return dtls_srtp_bytes_equal(expected, digest, sizeof(expected)) ? 1 : 0;
++}
++
+ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
+   int ret;
+   dtls_srtp->remote_addr = addr;
+@@ -497,9 +666,25 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
+
+   const mbedtls_x509_crt* remote_crt;
+   if ((remote_crt = mbedtls_ssl_get_peer_cert(&dtls_srtp->ssl)) != NULL) {
++    unsigned char remote_digest[32];
++    int fingerprint_match;
++
++    dtls_srtp_x509_digest_bytes(remote_crt, remote_digest);
++
++    // 0035: the printable form is still filled in -- the engine shows it in
++    // its diagnostics.
+     dtls_srtp_x509_digest(remote_crt, dtls_srtp->actual_remote_fingerprint);
+
+-    if (strncmp(dtls_srtp->remote_fingerprint, dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH) != 0) {
++    // 0006: compare the DIGEST BYTES, not the two strings.  The peer may
++    // print its fingerprint in lower case (libwebrtc prints it in upper
++    // case) -- the old strncmp() turned that difference into a mismatch
++    // even though the certificate was the right one.
++    fingerprint_match = dtls_srtp_fingerprint_matches(
++        dtls_srtp->remote_fingerprint,
++        (size_t)dtls_srtp_bounded_len(dtls_srtp->remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
++        remote_digest);
++
++    if (fingerprint_match != 1) {
+       char expected_prefix[16];
+       char actual_prefix[16];
+       dtls_srtp_fingerprint_summary(dtls_srtp->remote_fingerprint, expected_prefix, sizeof(expected_prefix));
+@@ -508,12 +693,19 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
+       // handshake never started" and "the handshake ran and the peer was
+       // rejected".
+       dtls_srtp->fingerprint_check = -1;
+-      LOGE("DTLS fingerprint mismatch: expected alg=%s len=%d prefix=%s, actual len=%d prefix=%s",
+-           dtls_srtp->remote_fingerprint_alg[0] ? dtls_srtp->remote_fingerprint_alg : "?",
+-           dtls_srtp_bounded_len(dtls_srtp->remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
+-           expected_prefix,
+-           dtls_srtp_bounded_len(dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
+-           actual_prefix);
++      if (fingerprint_match < 0) {
++        LOGE("DTLS fingerprint: the fingerprint the peer announced cannot be parsed: alg=%s len=%d prefix=%s",
++             dtls_srtp->remote_fingerprint_alg[0] ? dtls_srtp->remote_fingerprint_alg : "?",
++             dtls_srtp_bounded_len(dtls_srtp->remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
++             expected_prefix);
++      } else {
++        LOGE("DTLS fingerprint mismatch: expected alg=%s len=%d prefix=%s, actual len=%d prefix=%s",
++             dtls_srtp->remote_fingerprint_alg[0] ? dtls_srtp->remote_fingerprint_alg : "?",
++             dtls_srtp_bounded_len(dtls_srtp->remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
++             expected_prefix,
++             dtls_srtp_bounded_len(dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
++             actual_prefix);
++      }
+       return -1;
+     }
+     dtls_srtp->fingerprint_check = 1;

@@ -53,6 +53,9 @@ type ClassOf<T> = {
 export type AudioContextHandle = Opaque<'AudioContextHandle'>;
 export type AudioNodeHandle = Opaque<'AudioNodeHandle'>;
 
+/** A live Opus track (source/opus-decoder.cc). */
+export type OpusTrackHandle = Opaque<'OpusTrackHandle'>;
+
 export interface BtleScanResult {
 	address: string;
 	name?: string;
@@ -101,10 +104,21 @@ export type BtleEvent =
 
 export type VideoHandle = Opaque<'VideoHandle'>;
 
+/** A W3C WebCodecs VideoDecoder instance (source/webcodecs.cc). */
+export type VideoDecoderHandle = Opaque<'VideoDecoderHandle'>;
+/** A W3C WebCodecs VideoFrame instance (source/webcodecs.cc). */
+export type VideoFrameHandle = Opaque<'VideoFrameHandle'>;
+
 export interface VideoMetadata {
 	width: number;
 	height: number;
 	duration: number;
+	/**
+	 * True when `duration` is a real length. False for a source with no
+	 * container duration (a streamed feed has no moov) -- the `duration`
+	 * getter then returns `NaN`, never a made-up number.
+	 */
+	durationKnown: boolean;
 	hasAudio: boolean;
 	hasVideo: boolean;
 }
@@ -121,6 +135,19 @@ export interface VideoPlaybackState {
 	droppedFrames: number;
 	/** Sticky fatal decode error message (if any). */
 	error?: string;
+	/**
+	 * The media's video dimensions as the decoder knows them right now.
+	 * 0 before the first frame. For a source whose container carries no
+	 * size (a raw H.264 feed) this is where the size parsed out of the
+	 * first key frame's SPS shows up.
+	 */
+	width?: number;
+	/** The media's video height as the decoder knows it right now. */
+	height?: number;
+	/** The media's duration in seconds (0 when unknown). */
+	duration?: number;
+	/** True when `duration` is a real length rather than "unknown". */
+	durationKnown?: boolean;
 }
 type FileHandle = Opaque<'FileHandle'>;
 type CanvasGradientOpaque = Opaque<'CanvasGradientOpaque'>;
@@ -222,6 +249,7 @@ export interface Init {
 	appletGetAppletType(): number;
 	appletGetOperationMode(): number;
 	appletSetMediaPlaybackState(state: boolean): void;
+	appletSetKeepAwake(state: boolean): number;
 
 	// battery.c
 	batteryInit(): void;
@@ -833,6 +861,47 @@ export interface Init {
 	): void;
 	/** Current gain reduction in dB (<= 0) for DynamicsCompressorNode.reduction. */
 	audioCompressorReduction(node: AudioNodeHandle): number;
+
+	// opus-decoder.cc — raw Opus (RFC 6716) decoding for WebRTC audio tracks.
+	//
+	// A WebRTC audio track is NOT a container: RFC 7587 says the RTP payload
+	// of an audio packet is exactly one Opus packet, so the bytes go straight
+	// into ffmpeg's native opus decoder.  The decoded PCM is written into an
+	// audio-graph stream-source node, from where it reaches the speakers.
+	/** Create a track that decodes Opus packets into `channels` (1 or 2). */
+	opusTrackNew(ctx: AudioContextHandle, channels: number): OpusTrackHandle;
+	/** Feed one Opus packet; returns the number of PCM frames produced. */
+	opusTrackPush(track: OpusTrackHandle, packet: BufferSource): number;
+	/** Start (true) or stop (false) the output. */
+	opusTrackSetPlaying(track: OpusTrackHandle, playing: boolean): void;
+	/** The graph node the decoded PCM is written into. */
+	opusTrackNode(track: OpusTrackHandle): AudioNodeHandle;
+	/** Copy the newest decoded PCM into `out` (interleaved stereo f32);
+	 * returns the number of stereo frames written. */
+	opusTrackRead(track: OpusTrackHandle, out: Float32Array): number;
+	/** Counters of the decoded stream (packets, frames, RMS, peak, ...). */
+	opusTrackStats(track: OpusTrackHandle): {
+		packets: number;
+		frames: number;
+		rms: number;
+		peak: number;
+		errors: number;
+		sampleRate: number;
+		channels: number;
+		graphRate: number;
+	};
+	/** The RFC 6716 TOC of one Opus packet (null when it is not a packet). */
+	opusPacketInfo(
+		packet: BufferSource,
+	): {
+		config: number;
+		frameCode: number;
+		frameCount: number;
+		frameTenthsMs: number;
+		totalTenthsMs: number;
+		samples: number;
+		exact: boolean;
+	} | null;
 	/** Fill `out` with the analyser's most-recent time-domain samples
 	 * (newest last, each in [-1, 1]). `out.length` samples are returned. */
 	audioAnalyserFloatTimeData(node: AudioNodeHandle, out: Float32Array): void;
@@ -1093,6 +1162,46 @@ export interface Init {
 
 	// (Uint8Array base64/hex methods are provided natively by V8 — no binding.)
 
+	// webrtc.cc — native WebRTC binding (libpeer backend).
+	//
+	// The backend is poll-based and single-threaded: `webrtcTick()` drives
+	// the state machine and must be called on the loop thread (the glue in
+	// native-webrtc.ts calls it from a timer).
+	//
+	// The event sink receives (peerId, kind, payload) where payload is a
+	// plain object -- NOT a JSON string -- because DataChannel payloads are
+	// binary and JSON cannot carry them.
+	webrtcCreatePeer(
+		urls: string[],
+		usernames: string[],
+		credentials: string[],
+	): number;
+	webrtcDestroyPeer(peerId: number): void;
+	webrtcSetRemoteDescription(
+		peerId: number,
+		sdp: string,
+		isOffer: boolean,
+	): void;
+	webrtcCreateAnswer(peerId: number): string;
+	webrtcSetLocalDescription(peerId: number, sdp: string): void;
+	/**
+	 * Tell the backend that the ANSWER went out to the cloud (patch 0037).
+	 *
+	 * Until then no ICE connectivity check leaves: the cloud cannot answer a
+	 * check that arrives before it has processed our answer (it does not know
+	 * our ICE credentials yet) and drops it.
+	 */
+	webrtcNotifyAnswerSent(peerId: number): void;
+	webrtcAddIceCandidate(peerId: number, candidate: string): void;
+	webrtcClosePeer(peerId: number): void;
+	webrtcGetStats(peerId: number): string;
+	webrtcDcSend(peerId: number, sid: number, data: ArrayBuffer): void;
+	webrtcDcClose(peerId: number, sid: number): void;
+	webrtcOnEvent(
+		cb: (peerId: number, kind: string, payload: Record<string, unknown>) => void,
+	): void;
+	webrtcTick(): void;
+
 	// window.c
 	windowInit(c: Window): void;
 
@@ -1101,6 +1210,64 @@ export interface Init {
 	// backing + class installer are exposed on `$`.
 	path2dNew(path?: unknown): unknown;
 	path2dInitClass(Path2D: Function): void;
+
+	// webcodecs.cc — W3C WebCodecs video trio (VideoDecoder / VideoFrame /
+	// EncodedVideoChunk). The decoder is a raw-bitstream (AVCodec) decoder:
+	// it takes bare access units, not a container.
+	webcodecsVideoDecoderNew(): VideoDecoderHandle;
+	/** Install the read-only attributes on VideoDecoder.prototype. */
+	webcodecsVideoDecoderInitClass(ctor: Function): void;
+	/** Returns "" on success, an error message otherwise. */
+	webcodecsVideoDecoderConfigure(
+		dec: VideoDecoderHandle,
+		codec: string,
+		codedWidth: number,
+		codedHeight: number,
+		description: ArrayBuffer | null,
+		hardware: boolean,
+		/** ★ 2026-10-26: planar I420 output (1.5 B/px) instead of BGRA (4 B/px). */
+		yuv?: boolean,
+	): string;
+	webcodecsVideoDecoderDecode(
+		dec: VideoDecoderHandle,
+		data: BufferSource,
+		key: boolean,
+		timestamp: number,
+		duration: number,
+	): void;
+	webcodecsVideoDecoderFlush(dec: VideoDecoderHandle): void;
+	webcodecsVideoDecoderReset(dec: VideoDecoderHandle): void;
+	webcodecsVideoDecoderClose(dec: VideoDecoderHandle): void;
+	/** Hand over the next decoded frame, or undefined when there is none. */
+	webcodecsVideoDecoderPoll(dec: VideoDecoderHandle): VideoFrameHandle | undefined;
+	webcodecsVideoDecoderState(dec: VideoDecoderHandle): {
+		state: 'unconfigured' | 'configured' | 'closed';
+		codec: string;
+		numberOfFrames: number;
+		numberOfOutputFrames: number;
+		decodeQueueSize: number;
+		flushDone: boolean;
+		error: string | null;
+		// ★ 2026-10-26 (nx.js extension): the decode-path diagnostics the
+		//   native half (`patches/0055-webcodecs-diag-i420.patch`) added —
+		//   whether NVDEC was really used, which pixel format came out, the
+		//   planar conversion cost and the decoded frame size. Optional so an
+		//   engine built without 0055 still type-checks.
+		hwDecode?: boolean;
+		srcPixFmt?: string | null;
+		outFormat?: 'BGRA' | 'I420';
+		yuvColorspace?: number;
+		convertUs?: number;
+		hwFrames?: number;
+		swFrames?: number;
+		frameWidth?: number;
+		frameHeight?: number;
+	};
+	/** Install the read-only attributes on VideoFrame.prototype. */
+	webcodecsVideoFrameInitClass(ctor: Function): void;
+	webcodecsVideoFrameClose(frame: VideoFrameHandle): void;
+	/** Whether the engine can decode the given WebCodecs codec string. */
+	webcodecsIsConfigSupported(codec: string): boolean;
 }
 
 export const $: Init = (globalThis as any).$;

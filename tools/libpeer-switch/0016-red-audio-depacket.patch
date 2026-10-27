@@ -1,0 +1,156 @@
+RED audio: strip the fixed five byte wrapper in front of the opus frame.
+
+Why (settled on a real capture -- do not re-derive from the RFC)
+----------------------------------------------------------------
+The cloud answers "m=audio 9 UDP/TLS/RTP/SAVPF 63 111" and sends the opus
+frame wrapped.  12 audio packets were captured on the Switch; 5 decode and
+7 do not, and the two groups are trivially separated by their first byte:
+
+  B group (decodes, the ~1 s of music that is actually heard)
+    fc 30 27 34 ...            -> bare opus: TOC config=31 / stereo / 1 frame
+
+  A group (7 of 12, "cannot decode the Opus packet")
+    ef 0f 00 03 6f fc ff fe fc 7d f0 1f ...
+    ef 0f 00 d7 6f fc 7d e3 28 1c 77 ...
+    ef 0f 01 0b 6f fc 7d f0 1f ff 95 ...
+
+Parsing each A-group packet as opus at every offset 0..8 gives exactly one
+valid TOC per packet, at offset 5, with the SAME triple the B group yields at
+offset 0 (config=31 / stereo=1 / frames=1).  p[4] of every A packet is 0x6f,
+which is the F0/PT111 header of the RED primary block: "opus 111 follows".
+So the wrapper is the 5 bytes ef 0f 00 LL 6f and the opus packet starts at
+p[5].  Nothing else about the wrapper is explained, and nothing else needs to
+be: the whole rule is that one shape.
+
+What
+----
+  * rtp_red5_strip() (new, static, src/rtp.c) returns the payload offset by 5
+    and its length minus 5 when -- and only when -- ALL of these hold:
+      len >= 8, p[0] == 0xef, p[1] == 0x0f, p[4] == 0x6f, and the byte that
+      becomes the TOC can be a TOC at all (frame count code in the low two
+      bits; code 3 additionally needs a following count byte with 1..3).
+    Every other packet is forwarded byte for byte as before.  A packet that
+    does not decode is the old behaviour; a good packet mangled by a bad
+    guess is not acceptable.
+  * It runs in rtp_decode_generic() only, i.e. the audio path.  The result
+    pointer/length feed BOTH callbacks (on_audio_packet and on_packet).
+    rtp_decode_h264(), rtp_decode_h265() and rtp_decode_video() are not
+    touched.
+  * One-shot diagnostic for the first three audio packets, stderr only
+    (never stdout -- libnx binds stdout to the console renderer, see the note
+    in src/utils.h): "[red5] in=%d out=%d stripped=%d", stripped=0 means the
+    packet was not recognised and went up untouched.
+  * There is NO generic RFC 2198 chain walker.  The first attempt at this
+    patch walked the redundant blocks looking for the F=0 primary block, did
+    not match what the cloud actually sends, and fell back to forwarding the
+    wrapper -- which is why the audio stayed broken.  That code is not here:
+    the fixed shape above matches, or the packet goes up untouched.
+  * The 0012/B counters are untouched: pt 63 still bumps audio_red_packets,
+    pt 111 still bumps audio_opus_packets.
+
+Patch 0016 of the libpeer-switch series, applied after 0015-remb-ceil-1mbps.patch
+by tools/apply-libpeer-switch-patches.sh.
+
+
+diff --git a/src/rtp.c b/src/rtp.c
+index 1b7c31a..8ea2e38 100644
+--- a/src/rtp.c
++++ b/src/rtp.c
+@@ -1059,6 +1059,50 @@ static int rtp_decode_video(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size)
+   return rtp_decode_h264(rtp_decoder, buf, size);
+ }
+ 
++// 0016: strip the fixed five byte RED wrapper that precedes the opus frame.
++// Audio path only -- the video depacketizers below never call this.
++//
++// Ground truth from a capture on the real Switch (12 audio packets, 7 of them
++// undecodable): every packet the opus decoder refused starts with
++//
++//   ef 0f 00 LL 6f  <opus TOC> ...
++//
++// and the ones that decode start at the TOC with no wrapper at all.  Parsing
++// each of the 7 failing packets at every offset 0..8 yields a valid TOC
++// (config=31 / stereo / frame count 1 -- the same triple the working packets
++// give at offset 0) at offset 5 and nowhere else.  p[4] == 0x6f is the
++// F0/PT111 header of the RED primary block, i.e. "opus 111 follows", so the
++// bare opus packet begins at p[5].
++//
++// The shape is hard-coded on purpose: no generic RFC 2198 chain walker, no
++// fallback guess.  A packet that does not match every byte is forwarded
++// untouched -- "cannot decode" is the old behaviour, corrupting a packet that
++// does decode is not acceptable.
++static int rtp_red5_reports = 0;
++
++static int rtp_red5_strip(uint8_t* payload, size_t size, uint8_t** out_payload, size_t* out_size) {
++  if (payload == NULL || out_payload == NULL || out_size == NULL)
++    return 0;
++  // Five bytes of wrapper plus a TOC and at least two bytes of frame.
++  if (size < 8)
++    return 0;
++  if (payload[0] != 0xef || payload[1] != 0x0f || payload[4] != 0x6f)
++    return 0;
++
++  // What would become the TOC still has to look like one.  config (5 bits) and
++  // stereo are free -- any value is a legal configuration -- but the frame
++  // count code in the low two bits is not: code 3 means "the count is in the
++  // next byte", so that byte has to be there and hold a count of 1..3.
++  if ((payload[5] & 0x03) == 0x03) {
++    if (size < 9 || payload[6] == 0 || (payload[6] & 0x3f) > 3)
++      return 0;
++  }
++
++  *out_payload = payload + 5;
++  *out_size = size - 5;
++  return 1;
++}
++
+ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+   RtpPayloadView view;
+   if (rtp_parse_payload(buf, size, &view) != 0) {
+@@ -1077,19 +1121,32 @@ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size
+   if (buf != NULL) {
+     const uint8_t pt = ((RtpHeader*)buf)->type;
+     if (pt == 63) {
+-      // 0012/B: RED (RFC 2198) is not unwrapped on this side; counting it
+-      // separately makes "the sender speaks RED only" visible instead of
+-      // silent.
++      // 0012/B: counting RED separately makes "the sender speaks RED only"
++      // visible instead of silent.
+       rtp_decoder->audio_red_packets++;
+     } else if (pt == PT_OPUS) {
+       rtp_decoder->audio_opus_packets++;
+     }
+   }
+ 
++  // 0016: the opus decoder has to see the bare frame, not the RED wrapper.
++  // Stripped or not, both callbacks below get this pair -- the packet is never
++  // dropped and never half-rewritten.
++  uint8_t* audio_payload = view.payload;
++  size_t audio_size = view.payload_size;
++  const int stripped = rtp_red5_strip(view.payload, view.payload_size, &audio_payload, &audio_size);
++  // One-shot proof for the first three packets: stderr, never stdout -- libnx
++  // binds stdout to the console renderer, see the note in src/utils.h.
++  if (rtp_red5_reports < 3) {
++    rtp_red5_reports++;
++    fprintf(stderr, "[red5] in=%d out=%d stripped=%d\n", (int)view.payload_size,
++            (int)audio_size, stripped);
++  }
++
+   if (rtp_decoder->on_audio_packet != NULL) {
+     PeerAudioPacket packet = {
+-      .data = view.payload,
+-      .size = view.payload_size,
++      .data = audio_payload,
++      .size = audio_size,
+       .timestamp = view.timestamp,
+       .ssrc = rtp_get_ssrc(buf),
+       .sequence = read_be16(buf + 2),
+@@ -1101,7 +1158,7 @@ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size
+     // parsed-minus-produced is the "no consumer registered" verdict.
+     rtp_decoder->audio_units_produced++;
+   } else if (rtp_decoder->on_packet != NULL)
+-    rtp_decoder->on_packet(view.payload, view.payload_size, rtp_decoder->user_data);
++    rtp_decoder->on_packet(audio_payload, audio_size, rtp_decoder->user_data);
+   // even if there is no callback set, assume everything is ok for caller and do not return an error
+   return (int)size;
+ }

@@ -1,0 +1,1469 @@
+ICE roles, peer reflexive candidates and a wall clock retransmission
+schedule for libpeer (extern/libpeer).
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place: the next `git submodule update` would throw the changes away.  This
+patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it is
+the fifth patch of that series, after 0001-switch-webrtc-fixes,
+0002-no-stdout-log, 0003-h265-depacketizer and 0004-dtls-diagnostics).
+
+Why
+---
+Three independent defects kept the ICE state machine in "checking" forever,
+and a fourth one made the retransmission rhythm follow the render frame rate.
+
+1) The peer's USE-CANDIDATE was thrown away.
+
+   `stun.c` parsed ICE-CONTROLLING / ICE-CONTROLLED / USE-CANDIDATE and then
+   did nothing with them ("Do nothing").  We are the CONTROLLED agent -- the
+   cloud's offer carries no `a=ice-lite`, so `peer_connection.c` puts us in
+   AGENT_MODE_CONTROLLED -- which means the nomination belongs to the peer.
+   RFC 8445 section 7.2.5.1 says the controlled agent nominates the pair the
+   USE-CANDIDATE request arrived on.  We did not: the nomination had NO
+   effect at all.
+
+   `stun.c` now saves the attributes (has_use_candidate, has_ice_controlling,
+   has_ice_controlled, ice_tie_breaker) and `agent_process_stun_request()`
+   nominates the matching pair.
+
+2) `typ prflx` was a parse error.
+
+   `ice.c` only knew host / srflx / relay and answered "Unknown candidate
+   type" for a peer reflexive candidate -- even though `ice.h` has had
+   ICE_CANDIDATE_TYPE_PRFLX in its enum all along.  The cloud builds a prflx
+   candidate for us when it learns our NAT mapping from our own check, so the
+   candidate the cloud nominates simply did not exist on our side.
+
+3) A binding request from an unknown address created nothing.
+
+   `agent_process_stun_request()` used the source address only to send the
+   binding response back.  The cloud learns our public mapping from our own
+   connectivity check and then sends ITS check to that address: that address
+   is not in `remote_candidates`, so there was no pair to nominate.
+
+   The agent now creates a peer reflexive remote candidate for such a source
+   and pairs it with the local candidates (RFC 8445 section 7.2.5).
+
+   ★ ORDER: the prflx candidate is created AND paired FIRST, and only then
+     is the USE-CANDIDATE honoured -- without a pair there is nothing to
+     nominate, so the two have to work together.
+
+   The candidate is built the way libwebrtc builds it
+   (P2PTransportChannel::MaybeAddPeerReflexiveCandidate):
+     * type preference 110 for prflx (host 126 / prflx 110 / srflx 100 /
+       relay 0),
+     * local preference 65535 (the old code used the ephemeral port),
+     * component 1,
+     * and the PRIORITY of the candidate is the PRIORITY the peer put into
+       ITS request -- the peer computed it for the pair it is checking.  The
+       request's PRIORITY attribute is parsed now (stun.c used to drop it).
+
+   The resulting priorities match the reference values of the official
+   client exactly:
+       host  0x7EFFFFFF   prflx 0x6EFFFFFF   srflx 0x64FFFFFF   relay 0x00FFFFFF
+
+   ★ ORDER: the formula is computed first and the request's PRIORITY
+     OVERWRITES it -- the request wins, the formula is only the fallback for
+     a request without a PRIORITY attribute.
+   ★ A peer reflexive candidate is NEVER advertised: it is only ever a
+     REMOTE candidate, and ice_candidate_to_description() does not
+     serialize it (RFC 8445 section 15.1.1).
+
+4) A binding response was accepted from anybody.
+
+   `agent_process_stun_response()` counted every response it could parse and
+   marked the nominated pair SUCCEEDED.  The response is now checked against
+   the candidate the check was sent to (source address) and against the
+   transaction id of a check that is still in flight; a response that does
+   not match is dropped and counted in `rejected_binding_responses`.
+   `addr_equal()` was a stub that always returned 1 ("// TODO") -- it now
+   compares family, address and port.
+
+   All THREE checks of libwebrtc's StunRequestManager::CheckResponse() are
+   in place:
+     1) MESSAGE-INTEGRITY + FINGERPRINT -- `stun_msg_is_valid()` verifies
+        both (FINGERPRINT = CRC32, MESSAGE-INTEGRITY = HMAC-SHA1 over the
+        message with the ICE short term credential, i.e. the peer's
+        "a=ice-pwd"), so the remote password IS kept and the HMAC IS
+        computed -- the check was already there, it was just the only one;
+     2) the source address;
+     3) the transaction id.
+
+   ★ A dropped response does NOT trigger an immediate retry: the
+     retransmission is driven by the wall clock schedule
+     (agent_conncheck_due()), so bad responses cannot amplify the traffic.
+
+5) The connectivity check was retransmitted on a FRAME count.
+
+   `agent_connectivity_check()` sent a check when
+   `nominated_pair->conncheck % AGENT_CONNCHECK_PERIOD == 0`, and
+   `conncheck` counts the peer_connection_loop() calls -- and
+   peer_connection_loop() is driven by the RENDER FRAME.  The ICE rhythm
+   therefore followed the frame rate (23..31 fps on the device) instead of
+   the clock: the second check went out after 100 frames (~3.3 s at 30 fps)
+   and the give-up after 1000 frames (~47.6 s at 21 fps).  That is the
+   "sometimes 3 seconds, sometimes 48 seconds" behaviour.
+
+   The schedule is now a wall clock deadline: 100 ms, doubling on every
+   unanswered check, capped at 2 s (RFC 8445 section 7.2.5).  `conncheck`
+   stays as the "how many did we send" counter.
+
+6) A pair that had succeeded did not end the ICE.
+
+   `agent_select_candidate_pair()` set `selected_pair` in its SUCCEEDED
+   branch but left `nominated_pair` alone -- and `agent_connectivity_check()`
+   only ever looks at `nominated_pair`.  A binding response that arrived
+   outside of a connectivity check call therefore left the peer connection in
+   "checking" forever.  `nominated_pair` and `selected_pair` are kept in sync
+   now, and a SUCCEEDED pair wins over a FROZEN one.
+
+7) The CHECKING state had no timeout at all.
+
+   `peer_connection.c` broke out of the loop when the candidate pair table
+   was empty and never came back.  The state now fails after
+   PEER_ICE_CHECKING_TIMEOUT_MS (5 s) with a reason
+   (no_candidate_pairs / pair_never_nominated / no_binding_response /
+   response_not_selected) and the pair table is logged WHILE we are still
+   checking -- the diagnostic used to be printed only from dtls_start and
+   transport_completed, so an ICE that never succeeded printed nothing.
+
+8) One datagram per rendered frame.
+
+   The engine read exactly ONE datagram per tick, which capped the session at
+   ~60 packets per second (less at 23..31 fps) and dropped everything above
+   it in the kernel -- that is the media loss.  Both the CHECKING and the
+   COMPLETED state now DRAIN the socket (up to AGENT_RECV_DRAIN_MAX = 32
+   datagrams per tick).
+
+9) Two smaller ones.
+
+   `AGENT_STUN_RECV_MAXTIMES` 1000 -> 100 (the synchronous STUN receive in
+   createAnswer now waits 100 ms per server instead of 1 s), and the
+   `SO_RCVBUF` request 2 MiB -> 256 KiB (2 MiB ALWAYS failed on the Switch,
+   so the log never showed the real buffer size).
+
+10) The DTLS certificate is an ECDSA P-256 key now.
+
+   `CONFIG_DTLS_USE_ECDSA` was 0, so the self signed certificate was a
+   1024 bit RSA key.  The official native client (StarRailCloud 4.6.0) is
+   BoringSSL with a self signed ECDSA P-256 certificate, and every modern
+   TLS stack refuses a 1024 bit RSA certificate by default (OpenSSL 3 with
+   SECLEVEL >= 2).  libpeer already had the ECDSA branch and it generates
+   exactly SECP256R1, so this is only the switch.  The certificate buffer is
+   sized explicitly now (CONFIG_DTLS_CERT_BUFFER_SIZE) instead of after
+   RSA_KEY_LENGTH, and the key generation failures are no longer ignored.
+
+11) The first connectivity check left BEFORE the answer was on the wire.
+
+   `peer_connection_create_answer()` entered the CHECKING state right away,
+   so the first check went out one frame later -- while the answer was still
+   on its way to the cloud.  The cloud had not processed our answer yet, so
+   it did not know our ICE credentials and DROPPED the check.  The next check
+   went out 100 frames later (~3.3 s at 30 fps) and THAT one was answered.
+   That is the "sometimes it connects after 3 seconds" number -- it was not
+   luck, it was the retransmission.
+
+   The CHECKING transition now waits for the answer to be on the wire:
+   `peer_connection_set_answer_sent()` releases it (the engine calls it when
+   the page reports that the answer went out over the signalling channel),
+   and a fallback (PEER_ANSWER_SENT_FALLBACK_MS) releases it when the report
+   never arrives, so a page that does not implement the report still
+   connects.
+
+   The official client does the same: createAnswer() -> setLocalDescription()
+   -> send the answer -> only then the ICE gathering starts.  Our libpeer
+   entered CHECKING inside createAnswer(), i.e. before setLocalDescription().
+
+The engine side changes of patch 0037 live in the engine patch itself.
+diff --git a/src/address.c b/src/address.c
+index 1618ede..30ed78b 100644
+--- a/src/address.c
++++ b/src/address.c
+@@ -54,6 +54,25 @@ int addr_to_string(const Address* addr, char* buf, size_t len) {
+ }
+
+ int addr_equal(const Address* a, const Address* b) {
+-  // TODO
+-  return 1;
++  // 0037: this used to be a stub that ALWAYS returned 1 ("// TODO").
++  //
++  // It is used now to check that a binding response really comes from the
++  // candidate the connectivity check was sent to, so it has to compare the
++  // family, the address AND the port.
++  if (!a || !b) {
++    return 0;
++  }
++  if (a->family != b->family) {
++    return 0;
++  }
++  if (a->port != b->port) {
++    return 0;
++  }
++  switch (a->family) {
++    case AF_INET6:
++      return memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr, sizeof(a->sin6.sin6_addr)) == 0;
++    case AF_INET:
++    default:
++      return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr;
++  }
+ }
+diff --git a/src/agent.c b/src/agent.c
+index af90e6a..4e786f8 100644
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -14,10 +14,27 @@
+ #include "utils.h"
+
+ #define AGENT_POLL_TIMEOUT 1
+-#define AGENT_CONNCHECK_MAX 1000
+-#define AGENT_CONNCHECK_SWITCH 300
+-#define AGENT_CONNCHECK_PERIOD 100
+-#define AGENT_STUN_RECV_MAXTIMES 1000
++#define AGENT_STUN_RECV_MAXTIMES 100
++
++// 0037: the ICE retransmission schedule (RFC 8445 section 7.2.5).
++//
++// The retransmission interval is a WALL CLOCK deadline.  It used to be a
++// FRAME count (`conncheck % AGENT_CONNCHECK_PERIOD == 0`), and peer_connection
++// _loop() is driven by the render frame, so the ICE rhythm followed the frame
++// rate (23..31 fps on the device) instead of the clock.
++//
++// 100 ms -> 200 ms -> 400 ms -> ... -> 2000 ms (cap).
++#define AGENT_CONNCHECK_INTERVAL_BASE_MS 100
++#define AGENT_CONNCHECK_INTERVAL_MAX_MS 2000
++
++// 0037: how long a nominated pair may stay in progress.  The old code counted
++// 1000 loop iterations, which is 16.7 s at 60 fps and 47.6 s at the 21 fps
++// the device really runs at -- the "48 seconds without any reaction".
++#define AGENT_CONNCHECK_PAIR_SWITCH_MS 3000
++#define AGENT_CONNCHECK_PAIR_TIMEOUT_MS 15000
++
++// 0037: how many datagrams one tick may take off the socket.
++// (AGENT_RECV_DRAIN_MAX lives in agent.h: peer_connection.c drains too.)
+
+ void agent_clear_candidates(Agent* agent) {
+   agent->local_candidates_count = 0;
+@@ -31,6 +48,18 @@ void agent_clear_candidates(Agent* agent) {
+   agent->consent_attempts = 0;
+   agent->consent_requests_sent = 0;
+   agent->binding_responses_received = 0;
++  // 0037: reset the ICE retransmission schedule together with the candidates.
++  agent->last_conncheck_sent_ms = 0;
++  agent->conncheck_interval_ms = AGENT_CONNCHECK_INTERVAL_BASE_MS;
++  agent->conncheck_requests_sent = 0;
++  agent->nominated_pair_started_ms = 0;
++  agent->non_stun_packets_received = 0;
++  // 0037: the ICE attributes of the peer and the outstanding checks.
++  agent->remote_use_candidate = 0;
++  agent->remote_is_controlling = 0;
++  agent->remote_tie_breaker = 0;
++  agent->conncheck_transaction_id_next = 0;
++  agent->rejected_binding_responses = 0;
+ }
+
+ // Generate the ICE tie-breaker for this session.
+@@ -61,10 +90,17 @@ static uint64_t agent_generate_tie_breaker(void) {
+
+ int agent_create(Agent* agent) {
+   int ret;
++  // 0037: remember how many sockets are really open.  With CONFIG_IPV6 == 0
++  // only udp_sockets[0] is opened and udp_sockets[1].fd stays 0 (calloc),
++  // which used to be fed into FD_ISSET() -- harmless today (fd 0 is stdin and
++  // is never in the set) but a read past the end of the fd_set the moment
++  // something else grabs fd 0.
++  agent->udp_socket_count = 0;
+   if ((ret = udp_socket_open(&agent->udp_sockets[0], AF_INET, 0)) < 0) {
+     LOGE("Failed to create UDP socket.");
+     return ret;
+   }
++  agent->udp_socket_count = 1;
+   LOGI("create IPv4 UDP socket: %d", agent->udp_sockets[0].fd);
+
+ #if CONFIG_IPV6
+@@ -72,6 +108,7 @@ int agent_create(Agent* agent) {
+     LOGE("Failed to create IPv6 UDP socket.");
+     return ret;
+   }
++  agent->udp_socket_count = 2;
+   LOGI("create IPv6 UDP socket: %d", agent->udp_sockets[1].fd);
+ #endif
+
+@@ -125,7 +162,14 @@ static int agent_socket_recv(Agent* agent, Address* addr, uint8_t* buf, int len,
+   } else if (ret == 0) {
+     // timeout
+   } else {
+-    for (i = 0; i < 2; i++) {
++    // 0037: only walk the sockets that were really opened.  The old loop ran
++    // over both entries, and with CONFIG_IPV6 == 0 udp_sockets[1].fd is 0
++    // (calloc), so FD_ISSET(0, ...) was evaluated on a descriptor that does
++    // not belong to us.
++    for (i = 0; i < agent->udp_socket_count; i++) {
++      if (agent->udp_sockets[i].fd < 0) {
++        continue;
++      }
+       if (FD_ISSET(agent->udp_sockets[i].fd, &rfds)) {
+         memset(buf, 0, len);
+         ret = udp_socket_recvfrom(&agent->udp_sockets[i], addr, buf, len);
+@@ -385,6 +429,106 @@ static void agent_create_binding_request(Agent* agent, StunMessage* msg, int nom
+   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->remote_upwd, strlen(agent->remote_upwd));
+ }
+
++// 0037: pair a remote candidate with every local candidate of the same
++// family.
++//
++// agent_update_candidate_pairs() cannot be reused for this: it adds a pair
++// for EVERY local x remote combination, so calling it a second time would
++// duplicate all the pairs that already exist.
++static void agent_pair_remote_candidate(Agent* agent, IceCandidate* remote) {
++  int i;
++  for (i = 0; i < agent->local_candidates_count; i++) {
++    if (agent->local_candidates[i].addr.family != remote->addr.family) {
++      continue;
++    }
++    if (agent->candidate_pairs_num >= AGENT_MAX_CANDIDATE_PAIRS) {
++      LOGE("candidate pair table is full");
++      return;
++    }
++    IceCandidatePair* pair = &agent->candidate_pairs[agent->candidate_pairs_num];
++    pair->local = &agent->local_candidates[i];
++    pair->remote = remote;
++    pair->priority = ice_candidate_pair_priority(agent->local_candidates[i].priority,
++                                                 remote->priority,
++                                                 agent->mode == AGENT_MODE_CONTROLLING);
++    pair->state = ICE_CANDIDATE_STATE_FROZEN;
++    pair->conncheck = 0;
++    agent->candidate_pairs_num++;
++  }
++}
++
++// 0037: create a peer reflexive remote candidate for `addr`.
++//
++// The cloud (ICE-CONTROLLING) learned our NAT mapping from our own
++// connectivity check and sends its check back to that address.  That address
++// is not in remote_candidates, so -- without this -- there is no pair the
++// cloud could nominate and ICE never left "checking".
++//
++// This is libwebrtc's MaybeAddPeerReflexiveCandidate(): the priority of the
++// candidate is the PRIORITY the peer put into ITS request (the peer computed
++// it for the pair it is checking), and it falls back to the local formula
++// (type preference 110 for prflx, local preference 65535) when the request
++// carries no PRIORITY.
++static void agent_add_peer_reflexive_candidate(Agent* agent, Address* addr,
++                                                int has_priority, uint32_t priority) {
++  int i;
++  char addr_string[ADDRSTRLEN];
++
++  for (i = 0; i < agent->remote_candidates_count; i++) {
++    if (addr_equal(&agent->remote_candidates[i].addr, addr)) {
++      return;  // we know this address already
++    }
++  }
++
++  if (agent->remote_candidates_count >= AGENT_MAX_CANDIDATES) {
++    LOGW("remote candidate table is full -- cannot add the peer reflexive candidate");
++    return;
++  }
++
++  IceCandidate* candidate = &agent->remote_candidates[agent->remote_candidates_count];
++  // ice_candidate_create() computes the formula priority
++  // (type preference 110 for prflx, local preference 65535, component 1).
++  ice_candidate_create(candidate, agent->remote_candidates_count, ICE_CANDIDATE_TYPE_PRFLX, addr);
++  candidate->raddr = *addr;
++  if (has_priority) {
++    // 0037: the PRIORITY of the request WINS -- the peer computed it for the
++    // pair it is checking, and libwebrtc takes it as it is
++    // (P2PTransportChannel::MaybeAddPeerReflexiveCandidate).
++    candidate->priority = priority;
++  }
++  agent->remote_candidates_count++;
++
++  addr_to_string(addr, addr_string, sizeof(addr_string));
++  LOGI("added a peer reflexive remote candidate: %s:%d priority=%u (remote=%d)",
++       addr_string, addr->port, candidate->priority, agent->remote_candidates_count);
++
++  agent_pair_remote_candidate(agent, candidate);
++  agent_sort_candidate_pairs(agent);
++}
++
++// 0037: the peer nominated a pair.
++//
++// RFC 8445 section 7.2.5.1: the controlled agent nominates the pair the
++// USE-CANDIDATE request arrived on.  Before this the attribute was dropped
++// in stun.c, so the nomination of the ICE-CONTROLLING peer had NO effect.
++static void agent_nominate_pair_for_remote(Agent* agent, Address* addr) {
++  int i;
++  for (i = 0; i < agent->candidate_pairs_num; i++) {
++    IceCandidatePair* pair = &agent->candidate_pairs[i];
++    if (!pair->remote || !addr_equal(&pair->remote->addr, addr)) {
++      continue;
++    }
++    pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
++    agent->selected_pair = pair;
++    agent->nominated_pair = pair;
++    agent->use_candidate = 1;
++    agent->remote_use_candidate = 1;
++    LOGI("the peer nominated the candidate pair (USE-CANDIDATE)");
++    return;
++  }
++  LOGW("USE-CANDIDATE received, but no candidate pair matches the source address");
++}
++
+ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* addr) {
+   StunMessage msg;
+   StunHeader* header;
+@@ -393,6 +537,24 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
+       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->local_upwd) == 0) {
+         header = (StunHeader*)stun_msg->buf;
+         memcpy(agent->transaction_id, header->transaction_id, sizeof(header->transaction_id));
++
++        // 0037: the source of the request may be an address we do not know
++        // yet -- the cloud learned our NAT mapping from our own check and now
++        // sends its check back to it.  Create the peer reflexive candidate for
++        // it, otherwise the cloud's USE-CANDIDATE has nothing to nominate.
++        agent_add_peer_reflexive_candidate(agent, addr, stun_msg->has_priority, stun_msg->priority);
++
++        // 0037: we are the CONTROLLED agent (the cloud's offer has no
++        // a=ice-lite), so the peer's nomination is the one that counts.
++        if (stun_msg->has_ice_controlling) {
++          agent->remote_is_controlling = 1;
++          agent->remote_tie_breaker = stun_msg->ice_tie_breaker;
++        }
++        if (stun_msg->has_use_candidate) {
++          agent->remote_use_candidate = 1;
++          agent_nominate_pair_for_remote(agent, addr);
++        }
++
+         agent_create_binding_response(agent, &msg, addr);
+         agent_socket_send(agent, addr, msg.buf, msg.size);
+         agent->binding_request_time = ports_get_epoch_time();
+@@ -403,10 +565,72 @@ void agent_process_stun_request(Agent* agent, StunMessage* stun_msg, Address* ad
+   }
+ }
+
+-void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
++// 0037: remember the transaction id of a connectivity check that went out.
++static void agent_conncheck_remember_transaction_id(Agent* agent, const uint32_t* transaction_id) {
++  const uint32_t slot = agent->conncheck_transaction_id_next % AGENT_CONNCHECK_TXID_SLOTS;
++  memcpy(agent->conncheck_transaction_ids[slot], transaction_id, sizeof(uint32_t) * 3);
++  agent->conncheck_transaction_id_next++;
++}
++
++// 0037: does this binding response belong to one of our checks?
++//
++// (a) it has to come from the candidate the check was sent to, and
++// (b) it has to carry the transaction id of a check that is still in flight.
++//
++// Without the two checks anybody could push us into "connected" with a single
++// forged datagram -- and the media is plain RTP.
++static int agent_conncheck_response_matches(Agent* agent, StunMessage* stun_msg, Address* addr) {
++  StunHeader* header = (StunHeader*)stun_msg->buf;
++  uint32_t i;
++  int found = 0;
++
++  if (agent->conncheck_requests_sent == 0) {
++    LOGW("binding response without an outstanding connectivity check -- dropped");
++    return 0;
++  }
++
++  for (i = 0; i < AGENT_CONNCHECK_TXID_SLOTS; i++) {
++    if (memcmp(agent->conncheck_transaction_ids[i],
++               header->transaction_id,
++               sizeof(header->transaction_id)) == 0) {
++      found = 1;
++      break;
++    }
++  }
++  if (!found) {
++    LOGW("binding response with a foreign transaction id -- dropped");
++    return 0;
++  }
++
++  if (!agent->nominated_pair || !agent->nominated_pair->remote ||
++      !addr_equal(&agent->nominated_pair->remote->addr, addr)) {
++    LOGW("binding response from an address we did not check -- dropped");
++    return 0;
++  }
++
++  return 1;
++}
++
++void agent_process_stun_response(Agent* agent, StunMessage* stun_msg, Address* addr) {
+   switch (stun_msg->stunmethod) {
+     case STUN_METHOD_BINDING:
++      // 0037: the response has to belong to one of our checks.
++      //
++      // All THREE of the checks libwebrtc does are in place:
++      //   1) MESSAGE-INTEGRITY + FINGERPRINT -- stun_msg_is_valid() below
++      //      verifies both, with the ICE short term credential
++      //      (agent->remote_upwd, i.e. the "a=ice-pwd" of the peer);
++      //   2) the source address      -- agent_conncheck_response_matches();
++      //   3) the transaction id      -- agent_conncheck_response_matches().
+       if (stun_msg_is_valid(stun_msg->buf, stun_msg->size, agent->remote_upwd) == 0) {
++        if (!agent_conncheck_response_matches(agent, stun_msg, addr)) {
++          agent->rejected_binding_responses++;
++          // ★ a dropped response does NOT trigger an immediate retry: the
++          //   retransmission is driven by the wall clock schedule
++          //   (agent_conncheck_due), so a flood of bad responses cannot
++          //   amplify the traffic.
++          return;
++        }
+         const uint32_t now_ms = ports_get_epoch_time();
+         if (agent->last_binding_request_sent_ms != 0) {
+           const uint32_t sample_ms =
+@@ -429,14 +653,28 @@ void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
+   }
+ }
+
+-static int agent_recv_with_timeout(Agent* agent, uint8_t* buf, int len, int timeout_ms) {
++// 0037: read ONE datagram and say what it was.
++//
++// `agent_recv_with_timeout()` used to return 0 for a STUN message that was
++// received AND processed -- and 0 is exactly what a caller cannot tell from
++// "nothing to read".  A drain loop built on that return value stops at the
++// first STUN message and the datagram behind it stays in the socket forever.
++//
++// out_is_stun is set to 1 when the datagram was a STUN message (already
++// processed here), out_len receives the number of bytes for everything else.
++int agent_recv_datagram(Agent* agent, uint8_t* buf, int len, int timeout_ms, int* out_is_stun) {
+   int ret = -1;
+   StunMessage stun_msg;
+   Address addr;
+-  if ((ret = agent_socket_recv(agent, &addr, buf, len, timeout_ms)) > 0) {
+-    agent->binding_request_time = ports_get_epoch_time();
++
++  *out_is_stun = 0;
++  if ((ret = agent_socket_recv(agent, &addr, buf, len, timeout_ms)) <= 0) {
++    return ret;  // < 0: the socket is dry (timeout) or the read failed
+   }
+-  if (ret > 0 && stun_probe(buf, len) == 0) {
++
++  agent->binding_request_time = ports_get_epoch_time();
++
++  if (stun_probe(buf, len) == 0) {
+     memcpy(stun_msg.buf, buf, ret);
+     stun_msg.size = ret;
+     stun_parse_msg_buf(&stun_msg);
+@@ -445,24 +683,59 @@ static int agent_recv_with_timeout(Agent* agent, uint8_t* buf, int len, int time
+         agent_process_stun_request(agent, &stun_msg, &addr);
+         break;
+       case STUN_CLASS_RESPONSE:
+-        agent_process_stun_response(agent, &stun_msg);
++        agent_process_stun_response(agent, &stun_msg, &addr);
+         break;
+       case STUN_CLASS_ERROR:
+         break;
+       default:
+         break;
+     }
+-    ret = 0;
++    *out_is_stun = 1;
++    return 0;
+   }
++
++  // Not STUN: media / DTLS / SRTP.  The caller gets the bytes.
+   return ret;
+ }
+
+ int agent_recv(Agent* agent, uint8_t* buf, int len) {
+-  return agent_recv_with_timeout(agent, buf, len, AGENT_POLL_TIMEOUT);
++  int is_stun = 0;
++  return agent_recv_datagram(agent, buf, len, AGENT_POLL_TIMEOUT, &is_stun);
+ }
+
+ int agent_recv_nonblocking(Agent* agent, uint8_t* buf, int len) {
+-  return agent_recv_with_timeout(agent, buf, len, 0);
++  int is_stun = 0;
++  return agent_recv_datagram(agent, buf, len, 0, &is_stun);
++}
++
++// 0037: take everything that is pending off the socket (bounded).
++//
++// The engine used to read ONE datagram per rendered frame, so at 60 fps the
++// whole session could not exceed ~60 packets per second -- and less at the
++// 23..31 fps the device really runs at.  Everything above that was dropped
++// by the kernel, which shows up as media loss.
++//
++// The loop stops as soon as the socket runs dry.  Only the FIRST read pays
++// the poll timeout; the rest are non blocking, because the datagram is
++// already sitting in the socket.
++int agent_recv_drain(Agent* agent, uint8_t* buf, int len, int max_packets, int timeout_ms) {
++  int received = 0;
++  int is_stun = 0;
++  int ret;
++
++  while (received < max_packets) {
++    ret = agent_recv_datagram(agent, buf, len, timeout_ms, &is_stun);
++    if (ret < 0) {
++      break;  // the socket is dry
++    }
++    if (!is_stun) {
++      agent->non_stun_packets_received++;
++    }
++    received++;
++    timeout_ms = 0;  // the rest of the drain must not block
++  }
++
++  return received;
+ }
+
+ void agent_set_remote_description(Agent* agent, char* description) {
+@@ -559,11 +832,56 @@ static int agent_has_frozen_candidate_pair(Agent* agent, int start) {
+   return 0;
+ }
+
++// 0037: is the next connectivity check due?
++//
++// The decision is a WALL CLOCK deadline.  `conncheck` is only the "how many
++// did we send" counter -- it used to be the time base, and since
++// peer_connection_loop() runs once per rendered frame the ICE rhythm
++// followed the frame rate (23..31 fps on the device).
++//
++// When the deadline expires without an answer the interval is doubled
++// (RFC 8445 section 7.2.5): 100 -> 200 -> 400 -> ... -> 2000 ms.
++static int agent_conncheck_due(Agent* agent, uint32_t now_ms) {
++  if (agent->conncheck_requests_sent == 0) {
++    return 1;  // the first check goes out right away
++  }
++
++  const uint32_t elapsed = now_ms - agent->last_conncheck_sent_ms;
++  if (elapsed < agent->conncheck_interval_ms) {
++    return 0;
++  }
++
++  uint32_t next = agent->conncheck_interval_ms * 2u;
++  agent->conncheck_interval_ms =
++      (next > AGENT_CONNCHECK_INTERVAL_MAX_MS) ? AGENT_CONNCHECK_INTERVAL_MAX_MS : next;
++  return 1;
++}
++
++static void agent_conncheck_sent(Agent* agent, uint32_t now_ms) {
++  agent->last_conncheck_sent_ms = now_ms;
++  agent->conncheck_requests_sent++;
++}
++
+ int agent_connectivity_check(Agent* agent) {
+   char addr_string[ADDRSTRLEN];
+   uint8_t buf[1400];
+   StunMessage msg;
+
++  if (!agent->nominated_pair) {
++    return -1;
++  }
++
++  // 0037: a pair that already got a binding response is a SUCCESS, even when
++  // the response arrived outside of this call.  The old code only accepted
++  // ICE_CANDIDATE_STATE_INPROGRESS here, so a pair that had succeeded made
++  // agent_connectivity_check() bail out with -1 forever and the peer
++  // connection stayed in "checking" even though ICE was done -- the third
++  // libpeer defect, see patches/0037-NOTES.md.
++  if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
++    agent->selected_pair = agent->nominated_pair;
++    return 0;
++  }
++
+   if (agent->nominated_pair->state != ICE_CANDIDATE_STATE_INPROGRESS) {
+     LOGI("nominated pair is not in progress");
+     return -1;
+@@ -571,17 +889,24 @@ int agent_connectivity_check(Agent* agent) {
+
+   memset(&msg, 0, sizeof(msg));
+
+-  if (agent->nominated_pair->conncheck % AGENT_CONNCHECK_PERIOD == 0) {
++  const uint32_t now_ms = ports_get_epoch_time();
++  if (agent_conncheck_due(agent, now_ms)) {
+     addr_to_string(&agent->nominated_pair->remote->addr, addr_string, sizeof(addr_string));
+     LOGD("send binding request to remote ip: %s, port: %d", addr_string, agent->nominated_pair->remote->addr.port);
+-    agent_create_binding_request(agent, &msg, 1, 0);
++    // 0037: every connectivity check gets its OWN transaction id, so that a
++    // binding response can be matched against the check it answers.  The old
++    // code used the constant id of stun_msg_create() for all of them.
++    agent_create_binding_request(agent, &msg, 1, agent->conncheck_requests_sent + 1);
+     if (agent_socket_send(
+             agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size) >= 0) {
+-      agent->last_binding_request_sent_ms = ports_get_epoch_time();
++      agent->last_binding_request_sent_ms = now_ms;
++      agent_conncheck_remember_transaction_id(agent, ((StunHeader*)msg.buf)->transaction_id);
++      agent_conncheck_sent(agent, now_ms);
+     }
+   }
+
+-  agent_recv(agent, buf, sizeof(buf));
++  // 0037: drain the socket instead of taking ONE datagram per tick.
++  agent_recv_drain(agent, buf, sizeof(buf), AGENT_RECV_DRAIN_MAX, AGENT_POLL_TIMEOUT);
+
+   if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+     agent->selected_pair = agent->nominated_pair;
+@@ -613,28 +938,52 @@ int agent_maybe_send_consent_request(Agent* agent, uint32_t now_ms) {
+
+ int agent_select_candidate_pair(Agent* agent) {
+   int i;
++
++  // 0037: a SUCCEEDED pair wins.
++  //
++  // The peer (ICE-CONTROLLING) nominates the pair it used with
++  // USE-CANDIDATE, and that pair is marked SUCCEEDED.  The old loop returned
++  // at the first FROZEN pair and overwrote nominated_pair with it, which
++  // threw the nomination away -- and agent_connectivity_check() only ever
++  // looks at nominated_pair, so ICE stayed in "checking" forever.
++  for (i = 0; i < agent->candidate_pairs_num; i++) {
++    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
++      agent->selected_pair = &agent->candidate_pairs[i];
++      agent->nominated_pair = &agent->candidate_pairs[i];
++      return 0;
++    }
++  }
++
+   for (i = 0; i < agent->candidate_pairs_num; i++) {
+     if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FROZEN) {
+       // nominate this pair
+       agent->nominated_pair = &agent->candidate_pairs[i];
+       agent->candidate_pairs[i].conncheck = 0;
+       agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
++      // 0037: the nomination gets a WALL CLOCK budget.
++      agent->nominated_pair_started_ms = ports_get_epoch_time();
++      agent->conncheck_interval_ms = AGENT_CONNCHECK_INTERVAL_BASE_MS;
++      agent->conncheck_requests_sent = 0;
++      agent->last_conncheck_sent_ms = 0;
+       return 0;
+     } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_INPROGRESS) {
+       agent->candidate_pairs[i].conncheck++;
+-      if (agent->candidate_pairs[i].conncheck >= AGENT_CONNCHECK_SWITCH &&
+-          agent_has_frozen_candidate_pair(agent, i + 1)) {
++      // 0037: the give-up is a wall clock budget, not a frame count.  The old
++      // code counted 1000 loop iterations, which is 16.7 s at 60 fps and
++      // 47.6 s at the 21 fps the device really runs at.
++      const uint32_t now_ms = ports_get_epoch_time();
++      const uint32_t in_progress_ms =
++          agent->nominated_pair_started_ms ? (now_ms - agent->nominated_pair_started_ms) : 0;
++      if (agent_has_frozen_candidate_pair(agent, i + 1) &&
++          in_progress_ms >= AGENT_CONNCHECK_PAIR_SWITCH_MS) {
+         agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
+         continue;
+       }
+-      if (agent->candidate_pairs[i].conncheck < AGENT_CONNCHECK_MAX) {
++      if (in_progress_ms < AGENT_CONNCHECK_PAIR_TIMEOUT_MS) {
+         return 0;
+       }
+       agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_FAILED;
+     } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FAILED) {
+-    } else if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_SUCCEEDED) {
+-      agent->selected_pair = &agent->candidate_pairs[i];
+-      return 0;
+     }
+   }
+   // all candidate pairs are failed
+diff --git a/src/agent.h b/src/agent.h
+index 8097feb..b4539dc 100644
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -24,6 +24,17 @@
+ #define AGENT_MAX_CANDIDATE_PAIRS 100
+ #endif
+
++/**
++ * @brief how many connectivity check transaction ids are kept (0037).
++ *
++ * A binding response answers ONE of the checks that are still in flight, so
++ * the ids of the last few checks have to be remembered to tell a legitimate
++ * response from a foreign one.
++ */
++#ifndef AGENT_CONNCHECK_TXID_SLOTS
++#define AGENT_CONNCHECK_TXID_SLOTS 4
++#endif
++
+ typedef enum AgentState {
+
+   AGENT_STATE_GATHERING_ENDED = 0,
+@@ -65,6 +76,27 @@ struct Agent {
+   uint32_t consent_attempts;
+   uint32_t consent_requests_sent;
+   uint32_t binding_responses_received;
++  // 0037: the ICE retransmission schedule.
++  //
++  // The old code decided when the next connectivity check goes out from
++  // `nominated_pair->conncheck`, a counter that is bumped once per
++  // peer_connection_loop() call -- and peer_connection_loop() is driven by
++  // the RENDER FRAME.  The ICE rhythm therefore followed the frame rate
++  // (23..31 fps on the device) instead of the clock, which is why the same
++  // failure showed up as "connected in 3 seconds" sometimes and "nothing
++  // happens for 48 seconds" other times.
++  //
++  // `conncheck` stays as the "how many did we send" counter; the TIME BASE is
++  // the wall clock now.
++  uint32_t last_conncheck_sent_ms;  // wall clock of the last binding request
++  uint32_t conncheck_interval_ms;   // current retransmission interval (backoff)
++  uint32_t conncheck_requests_sent; // how many binding requests went out
++  uint32_t nominated_pair_started_ms; // wall clock of the nomination
++  // How many UDP sockets are really open (CONFIG_IPV6 decides).
++  int udp_socket_count;
++  // Datagrams that were NOT STUN (media / DTLS).  Counted so that "the peer
++  // sent something and we dropped it" is visible instead of silent.
++  uint32_t non_stun_packets_received;
+   AgentState state;
+
+   AgentMode mode;
+@@ -83,6 +115,24 @@ struct Agent {
+
+   int candidate_pairs_num;
+   int use_candidate;
++  // 0037: the ICE attributes of the peer.
++  //
++  // We are the CONTROLLED agent (the cloud's offer has no a=ice-lite), so the
++  // nomination belongs to the peer: it tells us WHICH pair is nominated with
++  // the USE-CANDIDATE attribute of its connectivity check.  The attribute
++  // used to be parsed and thrown away ("Do nothing"), so the nomination had
++  // no effect at all.
++  int remote_use_candidate;   // 1 = the peer sent USE-CANDIDATE
++  int remote_is_controlling;  // 1 = the peer sent ICE-CONTROLLING
++  uint64_t remote_tie_breaker;
++  // 0037: the transaction ids of the connectivity checks that are still in
++  // flight.  A response may answer ANY of them (the peer may answer check
++  // #1 after we already sent check #2), so a small ring is kept.
++  uint32_t conncheck_transaction_ids[AGENT_CONNCHECK_TXID_SLOTS][3];
++  uint32_t conncheck_transaction_id_next;
++  // 0037: binding responses that were dropped because they did not come
++  // from the candidate we checked, or carried a foreign transaction id.
++  uint32_t rejected_binding_responses;
+   uint32_t transaction_id[3];
+ };
+
+@@ -106,6 +156,34 @@ int agent_recv(Agent* agent, uint8_t* buf, int len);
+
+ int agent_recv_nonblocking(Agent* agent, uint8_t* buf, int len);
+
++/**
++ * @brief how many datagrams one tick may take off the socket (0037).
++ *
++ * The engine used to read ONE datagram per rendered frame, which capped the
++ * whole session at ~60 packets per second (less at the 23..31 fps the device
++ * really runs at) and dropped everything above it.
++ */
++#ifndef AGENT_RECV_DRAIN_MAX
++#define AGENT_RECV_DRAIN_MAX 32
++#endif
++
++/**
++ * @brief read ONE datagram and report what it was (0037).
++ *
++ * Returns -1 when the socket is dry, 0 when the datagram was a STUN message
++ * (it has already been processed here) and the number of bytes for anything
++ * else (media / DTLS / SRTP).  *out_is_stun tells the two "0" cases apart --
++ * agent_recv() cannot, which is why the drain loop needs this one.
++ */
++int agent_recv_datagram(Agent* agent, uint8_t* buf, int len, int timeout_ms, int* out_is_stun);
++
++/**
++ * @brief take everything that is pending off the socket, bounded (0037).
++ *
++ * Only the first read pays `timeout_ms`; the rest are non blocking.
++ */
++int agent_recv_drain(Agent* agent, uint8_t* buf, int len, int max_packets, int timeout_ms);
++
+ void agent_set_remote_description(Agent* agent, char* description);
+
+ int agent_select_candidate_pair(Agent* agent);
+diff --git a/src/config.h b/src/config.h
+index 8a0607f..ac1567b 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -4,6 +4,14 @@
+ // uncomment this if you want to handshake with a aiortc
+ // #define CONFIG_DTLS_USE_ECDSA 1
+
++// 0037: the buffer the PEM encoded self signed certificate is written into.
++// It used to be sized after RSA_KEY_LENGTH, which is meaningless now that
++// the certificate is an EC key (an EC certificate is SMALLER than the RSA
++// one, so the old size was enough -- but the coupling was nonsense).
++#ifndef CONFIG_DTLS_CERT_BUFFER_SIZE
++#define CONFIG_DTLS_CERT_BUFFER_SIZE 4096
++#endif
++
+ #define SCTP_MTU (1200)
+ #define CONFIG_MTU (1300)
+
+@@ -40,8 +48,18 @@
+ #define RSA_KEY_LENGTH 1024
+ #endif
+
++// 0037: the DTLS self signed certificate is an ECDSA P-256 key.
++//
++// The official native client (StarRailCloud 4.6.0) is BoringSSL with a self
++// signed ECDSA P-256 certificate, and every modern TLS stack refuses a
++// 1024 bit RSA certificate by default (OpenSSL 3 with SECLEVEL >= 2, the
++// BoringSSL default).  The old RSA-1024 certificate was therefore the prime
++// suspect for "ICE connects, DTLS handshake fails".
++//
++// libpeer already has the ECDSA branch (src/dtls_srtp.c) and it generates
++// exactly SECP256R1 / P-256, so this is only the switch.
+ #ifndef CONFIG_DTLS_USE_ECDSA
+-#define CONFIG_DTLS_USE_ECDSA 0
++#define CONFIG_DTLS_USE_ECDSA 1
+ #endif
+
+ #ifndef CONFIG_USE_USRSCTP
+diff --git a/src/dtls_srtp.c b/src/dtls_srtp.c
+index ab14b2b..73cbf58 100644
+--- a/src/dtls_srtp.c
++++ b/src/dtls_srtp.c
+@@ -83,7 +83,10 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
+ #endif
+   const char* pers = "dtls_srtp";
+
+-  cert_buf = (unsigned char*)malloc(RSA_KEY_LENGTH * 2);
++  // 0037: the buffer is sized explicitly, not after RSA_KEY_LENGTH -- the
++  // certificate is an EC key now, so the RSA key length says nothing about
++  // how much room the PEM needs.
++  cert_buf = (unsigned char*)malloc(CONFIG_DTLS_CERT_BUFFER_SIZE);
+   if (cert_buf == NULL) {
+     LOGE("malloc failed");
+     return -1;
+@@ -92,8 +95,19 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
+   mbedtls_ctr_drbg_seed(&dtls_srtp->ctr_drbg, mbedtls_entropy_func, &dtls_srtp->entropy, (const unsigned char*)pers, strlen(pers));
+
+ #if CONFIG_DTLS_USE_ECDSA
+-  mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
+-  mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(dtls_srtp->pkey), mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
++  // 0037: ECDSA P-256 (SECP256R1) -- the same key type the official native
++  // client uses (BoringSSL, self signed).  A 1024 bit RSA certificate is
++  // refused by every modern TLS stack by default.
++  ret = mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_ECKEY));
++  if (ret != 0) {
++    LOGE("mbedtls_pk_setup(ECKEY) failed -0x%.4x", (unsigned int)-ret);
++  }
++  ret = mbedtls_ecp_gen_key(MBEDTLS_ECP_DP_SECP256R1, mbedtls_pk_ec(dtls_srtp->pkey), mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
++  if (ret != 0) {
++    LOGE("mbedtls_ecp_gen_key failed -0x%.4x", (unsigned int)-ret);
++  } else {
++    LOGI("DTLS certificate: ECDSA P-256 (SECP256R1)");
++  }
+ #else
+   mbedtls_pk_setup(&dtls_srtp->pkey, mbedtls_pk_info_from_type(MBEDTLS_PK_RSA));
+   mbedtls_rsa_gen_key(mbedtls_pk_rsa(dtls_srtp->pkey), mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg, RSA_KEY_LENGTH, 65537);
+@@ -128,13 +142,13 @@ static int dtls_srtp_selfsign_cert(DtlsSrtp* dtls_srtp) {
+
+   mbedtls_x509write_crt_set_validity(&crt, "20180101000000", "20280101000000");
+
+-  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, 2 * RSA_KEY_LENGTH, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
++  ret = mbedtls_x509write_crt_pem(&crt, cert_buf, CONFIG_DTLS_CERT_BUFFER_SIZE, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
+
+   if (ret < 0) {
+     LOGE("mbedtls_x509write_crt_pem failed -0x%.4x", (unsigned int)-ret);
+   }
+
+-  mbedtls_x509_crt_parse(&dtls_srtp->cert, cert_buf, 2 * RSA_KEY_LENGTH);
++  mbedtls_x509_crt_parse(&dtls_srtp->cert, cert_buf, CONFIG_DTLS_CERT_BUFFER_SIZE);
+
+   mbedtls_x509write_crt_free(&crt);
+
+diff --git a/src/ice.c b/src/ice.c
+index 756e961..65b7a59 100644
+--- a/src/ice.c
++++ b/src/ice.c
+@@ -15,6 +15,10 @@ static uint8_t ice_candidate_type_preference(IceCandidateType type) {
+   switch (type) {
+     case ICE_CANDIDATE_TYPE_HOST:
+       return 126;
++    case ICE_CANDIDATE_TYPE_PRFLX:
++      // 0037: 110 for peer reflexive -- the value libwebrtc uses.  RFC 8445
++      // section 5.1.2.1 leaves room between host (126) and srflx (100).
++      return 110;
+     case ICE_CANDIDATE_TYPE_SRFLX:
+       return 100;
+     case ICE_CANDIDATE_TYPE_RELAY:
+@@ -25,7 +29,11 @@ static uint8_t ice_candidate_type_preference(IceCandidateType type) {
+ }
+
+ static uint16_t ice_candidate_local_preference(IceCandidate* candidate) {
+-  return candidate->addr.port;
++  // 0037: libwebrtc uses 65535 (the maximum) as the local preference.  The
++  // old code used the port, which made the priority of a candidate depend on
++  // an ephemeral port number.
++  (void)candidate;
++  return 65535;
+ }
+
+ static void ice_candidate_priority(IceCandidate* candidate) {
+@@ -60,6 +68,16 @@ void ice_candidate_to_description(IceCandidate* candidate, char* description, in
+     case ICE_CANDIDATE_TYPE_SRFLX:
+       snprintf(typ_raddr, sizeof(typ_raddr), "srflx raddr %s rport %d", addr_string, candidate->raddr.port);
+       break;
++    case ICE_CANDIDATE_TYPE_PRFLX:
++      // 0037: a peer reflexive candidate is NEVER advertised.
++      //
++      // libwebrtc keeps it in the local ICE agent's remote candidate list
++      // only -- it never goes into a local description (RFC 8445 section
++      // 15.1.1: "the agent MUST NOT include peer-reflexive candidates in
++      // the SDP").  A prflx candidate is only ever a REMOTE candidate in
++      // libpeer, so this branch is unreachable; it is here so that nobody
++      // can turn it into an advertised candidate by accident.
++      break;
+     case ICE_CANDIDATE_TYPE_RELAY:
+       snprintf(typ_raddr, sizeof(typ_raddr), "relay raddr %s rport %d", addr_string, candidate->raddr.port);
+     default:
+@@ -111,6 +129,15 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
+     candidate->type = ICE_CANDIDATE_TYPE_HOST;
+   } else if (strncmp(type, "srflx", 5) == 0) {
+     candidate->type = ICE_CANDIDATE_TYPE_SRFLX;
++  } else if (strncmp(type, "prflx", 5) == 0) {
++    // 0037: a peer reflexive candidate.
++    //
++    // The cloud (ICE-CONTROLLING) builds one for us when it learns our NAT
++    // mapping from our own connectivity check.  The old code answered
++    // "Unknown candidate type" and returned -1, so the candidate the cloud
++    // nominates simply did not exist on our side and ICE could never leave
++    // "checking".
++    candidate->type = ICE_CANDIDATE_TYPE_PRFLX;
+   } else if (strncmp(type, "relay", 5) == 0) {
+     candidate->type = ICE_CANDIDATE_TYPE_RELAY;
+   } else {
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index 115214c..7f11e10 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -27,6 +27,27 @@
+     }                                                                 \
+   }
+
++// 0037: how long the ICE "checking" state may take before it gives up.
++//
++// Before this the CHECKING state had no timeout at all: with an empty
++// candidate pair table peer_connection_loop() just `break`ed and the peer
++// connection stayed in "checking" forever (the "48 seconds without any
++// reaction").  5 s is generous for a connectivity check round trip.
++#define PEER_ICE_CHECKING_TIMEOUT_MS 5000
++
++// 0037: how often the CHECKING diagnostic is repeated (ms).
++#define PEER_ICE_CHECKING_DIAG_INTERVAL_MS 1000
++
++// 0037: how long the ICE connectivity check waits for the "the answer went
++// out" report before it starts anyway.
++//
++// The report comes from the page (the facade sends the answer over the
++// signalling channel and tells the engine).  A page that never reports it
++// must not deadlock the connection, so the check starts anyway after this
++// many milliseconds.  It is far above the signalling round trip, so the race
++// the fallback reintroduces is a rare corner case, not the normal path.
++#define PEER_ANSWER_SENT_FALLBACK_MS 1200
++
+ struct PeerConnection {
+   PeerConfiguration config;
+   PeerConnectionState state;
+@@ -97,6 +118,23 @@ struct PeerConnection {
+   int rtp_decrypt_failures;
+   int rtcp_decrypt_failures;
+   int sctp_read_events;
++  // 0037: the ICE "checking" watchdog.
++  //
++  // The CHECKING state had NO timeout at all: when the candidate pair table
++  // was empty the loop just `break`ed and the peer connection stayed in
++  // "checking" forever -- the "48 seconds without any reaction".
++  uint32_t ice_checking_started_ms;  // wall clock of the start of CHECKING
++  uint32_t ice_checking_diag_ms;     // wall clock of the last CHECKING log
++  // 0037: the answer has to be on the wire before the first connectivity
++  // check goes out.
++  //
++  // The check used to leave one frame after create_answer(), i.e. BEFORE
++  // the answer had been sent to the cloud.  The cloud had not processed our
++  // answer yet, so it did not know our ICE credentials and DROPPED the
++  // check; the next one went out 100 frames later (~3.3 s at 30 fps).  That
++  // is the "sometimes it connects after 3 seconds" number.
++  int answer_sent;          // 1 = the app reported that the answer went out
++  uint32_t answer_created_ms; // wall clock of create_answer()
+ };
+
+ static int peer_connection_send_rtcp_nack(PeerConnection* pc, uint32_t ssrc,
+@@ -271,6 +309,27 @@ static const char* peer_connection_ice_type_name(IceCandidateType type) {
+   }
+ }
+
++// 0037: why did ICE never finish?
++//
++// The three cases the next device run has to tell apart:
++//   no_candidate_pairs     the pair table is empty -- not one check was sent
++//   pair_never_nominated   there are pairs, but none was ever nominated
++//   no_binding_response    we sent checks, the peer never answered
++//   response_not_selected  the peer DID answer, but ICE still did not
++//                          finish (the libpeer SUCCEEDED-pair defect)
++static const char* peer_connection_ice_checking_reason(PeerConnection* pc) {
++  if (pc->agent.candidate_pairs_num == 0) {
++    return "no_candidate_pairs";
++  }
++  if (!pc->agent.nominated_pair) {
++    return "pair_never_nominated";
++  }
++  if (pc->agent.binding_responses_received == 0) {
++    return "no_binding_response";
++  }
++  return "response_not_selected";
++}
++
+ static void peer_connection_log_candidate_pairs(PeerConnection* pc, const char* reason) {
+   if (!pc) {
+     return;
+@@ -294,10 +353,12 @@ static void peer_connection_log_candidate_pairs(PeerConnection* pc, const char*
+     if (pair->remote) {
+       addr_to_string(&pair->remote->addr, remote, sizeof(remote));
+     }
+-    peer_connection_diag_log("ice_pair[%d] state=%s selected=%d local=%s/%s:%u remote=%s/%s:%u priority=%" PRIu64,
++    peer_connection_diag_log("ice_pair[%d] state=%s conncheck=%d selected=%d nominated=%d local=%s/%s:%u remote=%s/%s:%u priority=%" PRIu64,
+                              i,
+                              peer_connection_ice_state_name(pair->state),
++                             pair->conncheck,
+                              pair == pc->agent.selected_pair,
++                             pair == pc->agent.nominated_pair,
+                              pair->local
+                                  ? peer_connection_ice_type_name(pair->local->type)
+                                  : "none",
+@@ -714,18 +775,96 @@ int peer_connection_loop(PeerConnection* pc) {
+
+   switch (pc->state) {
+     case PEER_CONNECTION_NEW:
++      // 0037: the ICE connectivity check must not start before the answer is
++      // on the wire.
++      //
++      // The check used to leave one frame after create_answer(), i.e. BEFORE
++      // the answer had been sent to the cloud.  The cloud had not processed
++      // our answer yet, so it did not know our ICE credentials and DROPPED
++      // the check; the next one went out 100 frames later (~3.3 s at 30 fps).
++      // That is the "sometimes it connects after 3 seconds" number.
++      //
++      // The gate is released by peer_connection_set_answer_sent() (the engine
++      // calls it when the page reports that the answer went out).  The
++      // fallback keeps ICE alive when that report never arrives.
++      if (pc->answer_created_ms != 0) {
++        const uint32_t now_ms = ports_get_epoch_time();
++        const int answer_ready =
++            pc->answer_sent ||
++            (uint32_t)(now_ms - pc->answer_created_ms) >= PEER_ANSWER_SENT_FALLBACK_MS;
++        if (answer_ready) {
++          peer_connection_diag_log("ice_start -- the answer is on the wire (reported=%d)",
++                                   pc->answer_sent);
++          pc->ice_checking_started_ms = 0;
++          pc->ice_checking_diag_ms = 0;
++          STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
++        }
++      }
+       break;
+
+-    case PEER_CONNECTION_CHECKING:
++    case PEER_CONNECTION_CHECKING: {
++      // 0037: the CHECKING state gets a real watchdog.  Before this the
++      // state had NO timeout at all, so a peer connection whose pair table
++      // was empty stayed in "checking" forever.
++      const uint32_t now_ms = ports_get_epoch_time();
++      if (pc->ice_checking_started_ms == 0) {
++        pc->ice_checking_started_ms = now_ms;
++        pc->ice_checking_diag_ms = 0;
++      }
++
+       if (pc->agent.candidate_pairs_num == 0) {
++        if ((uint32_t)(now_ms - pc->ice_checking_started_ms) >= PEER_ICE_CHECKING_TIMEOUT_MS) {
++          peer_connection_diag_log(
++              "ice_checking_timeout reason=%s elapsedMs=%u pairs=%d local=%d remote=%d mode=%d iceLite=%d",
++              peer_connection_ice_checking_reason(pc),
++              (uint32_t)(now_ms - pc->ice_checking_started_ms),
++              pc->agent.candidate_pairs_num,
++              pc->agent.local_candidates_count,
++              pc->agent.remote_candidates_count,
++              pc->agent.mode,
++              pc->remote_ice_lite);
++          STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
++        }
+         break;
+       }
++
+       if (agent_select_candidate_pair(&pc->agent) < 0) {
++        peer_connection_diag_log("ice_checking_failed reason=all_pairs_failed pairs=%d",
++                                 pc->agent.candidate_pairs_num);
+         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+       } else if (agent_connectivity_check(&pc->agent) == 0) {
+         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
+       }
++
++      // 0037: log the pairs WHILE we are still checking.  The diagnostic
++      // used to be printed only from dtls_start / transport_completed, so an
++      // ICE that never succeeded printed nothing at all -- this line is the
++      // only thing that shows "which check, when, and what state".
++      if (pc->ice_checking_diag_ms == 0 ||
++          (uint32_t)(now_ms - pc->ice_checking_diag_ms) >= PEER_ICE_CHECKING_DIAG_INTERVAL_MS) {
++        pc->ice_checking_diag_ms = now_ms;
++        const uint32_t last_check_ms = pc->agent.last_conncheck_sent_ms;
++        const uint32_t last_check_ago_ms =
++            last_check_ms ? (now_ms - last_check_ms) : 0;
++        peer_connection_diag_log(
++            "ice_checking total=%d local=%d remote=%d mode=%d iceLite=%d conncheck=%d "
++            "requestsSent=%u intervalMs=%u lastCheckAgoMs=%u elapsedMs=%u responses=%u nonStun=%u",
++            pc->agent.candidate_pairs_num,
++            pc->agent.local_candidates_count,
++            pc->agent.remote_candidates_count,
++            pc->agent.mode,
++            pc->remote_ice_lite,
++            pc->agent.nominated_pair ? pc->agent.nominated_pair->conncheck : -1,
++            pc->agent.conncheck_requests_sent,
++            pc->agent.conncheck_interval_ms,
++            last_check_ago_ms,
++            (uint32_t)(now_ms - pc->ice_checking_started_ms),
++            pc->agent.binding_responses_received,
++            pc->agent.non_stun_packets_received);
++        peer_connection_log_candidate_pairs(pc, "checking");
++      }
+       break;
++    }
+
+     case PEER_CONNECTION_CONNECTED:
+       if (pc->dtls_handshake_attempts == 0) {
+@@ -782,6 +921,9 @@ int peer_connection_loop(PeerConnection* pc) {
+         pc->dtls_handshake_attempts = 0;
+         pc->dtls_handshake_started_ms = 0;
+         if (failed_pairs > 0) {
++          // 0037: the next remote gets a FRESH checking budget.
++          pc->ice_checking_started_ms = 0;
++          pc->ice_checking_diag_ms = 0;
+           STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
+         } else {
+           STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+@@ -801,7 +943,24 @@ int peer_connection_loop(PeerConnection* pc) {
+         if (packet_processed || pc->dtls_pending || pc->state != PEER_CONNECTION_COMPLETED)
+           break;
+       }
+-      if ((pc->agent_ret = agent_recv_nonblocking(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
++      // 0037: DRAIN the socket instead of taking ONE datagram per tick.
++      //
++      // One datagram per rendered frame capped the whole session at ~60
++      // packets per second (less at the 23..31 fps the device really runs
++      // at) and everything above it was dropped by the kernel -- that is the
++      // media loss.  The drain stops as soon as the socket is dry.
++      for (int drained = 0; drained < AGENT_RECV_DRAIN_MAX; drained++) {
++        int is_stun = 0;
++        pc->agent_ret = agent_recv_datagram(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf), 0, &is_stun);
++        if (pc->agent_ret < 0) {
++          break;  // the socket is dry
++        }
++        if (is_stun) {
++          // A STUN message (binding response / consent): the agent already
++          // processed it.  Keep draining -- the old code stopped here and
++          // the media packet behind the STUN one waited a whole frame.
++          continue;
++        }
+         const uint64_t arrival_us = ports_get_monotonic_time_us();
+         packet_processed = 1;
+         LOGD("agent_recv %d", pc->agent_ret);
+@@ -837,7 +996,7 @@ int peer_connection_loop(PeerConnection* pc) {
+             peer_connection_diag_log("rtcp_decrypt_failed failures=%d bytesAfter=%d",
+                                      pc->rtcp_decrypt_failures,
+                                      pc->agent_ret);
+-            break;
++            break;  // 0037: leaves the drain loop (it used to leave the switch)
+           }
+           peer_connection_incoming_rtcp(pc, pc->agent_buf, pc->agent_ret);
+
+@@ -860,7 +1019,7 @@ int peer_connection_loop(PeerConnection* pc) {
+             peer_connection_diag_log("rtp_decrypt_failed failures=%d bytesAfter=%d",
+                                      pc->rtp_decrypt_failures,
+                                      pc->agent_ret);
+-            break;
++            break;  // 0037: leaves the drain loop (it used to leave the switch)
+           }
+
+           twcc_receiver_record(&pc->twcc, pc->agent_buf, pc->agent_ret, arrival_us);
+@@ -1153,6 +1312,9 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
+   agent_set_remote_description(&pc->agent, (char*)sdp);
+   if (type == SDP_TYPE_ANSWER) {
+     agent_update_candidate_pairs(&pc->agent);
++    // 0037: a fresh CHECKING budget for this answer.
++    pc->ice_checking_started_ms = 0;
++    pc->ice_checking_diag_ms = 0;
+     STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
+   }
+ }
+@@ -1254,10 +1416,39 @@ const char* peer_connection_create_offer(PeerConnection* pc) {
+ const char* peer_connection_create_answer(PeerConnection* pc) {
+   const char* sdp = peer_connection_create_sdp(pc, SDP_TYPE_ANSWER);
+   agent_update_candidate_pairs(&pc->agent);
+-  STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
++  // 0037: do NOT enter CHECKING here.
++  //
++  // The answer has not been sent yet: the cloud has not seen our ICE
++  // credentials, so the first connectivity check would arrive before the
++  // cloud could answer it and would be dropped.  The transition into CHECKING
++  // happens in peer_connection_loop() once the answer is on the wire (see
++  // peer_connection_set_answer_sent() and PEER_ANSWER_SENT_FALLBACK_MS).
++  pc->answer_sent = 0;
++  pc->answer_created_ms = ports_get_epoch_time();
++  pc->ice_checking_started_ms = 0;
++  pc->ice_checking_diag_ms = 0;
+   return sdp;
+ }
+
++// 0037: tell libpeer that the answer went out to the cloud.
++//
++// The engine calls this when the page reports that the answer has been sent
++// over the signalling channel.  Until then no connectivity check goes out:
++// the cloud cannot answer a check that arrives before it has processed our
++// answer (it does not know our ICE credentials yet).
++//
++// @param[in] pc   the peer connection
++// @param[in] sent 1 = the answer is on the wire
++void peer_connection_set_answer_sent(PeerConnection* pc, int sent) {
++  if (!pc) {
++    return;
++  }
++  pc->answer_sent = sent != 0;
++  if (pc->answer_sent) {
++    peer_connection_diag_log("answer_sent -- the ICE connectivity check may start");
++  }
++}
++
+ int peer_connection_send_rtcp_pil(PeerConnection* pc, uint32_t ssrc) {
+   uint8_t plibuf[128];
+   int size = 12;
+diff --git a/src/peer_connection.h b/src/peer_connection.h
+index 34df677..66e1eac 100644
+--- a/src/peer_connection.h
++++ b/src/peer_connection.h
+@@ -205,6 +205,24 @@ int peer_connection_request_video_keyframe(PeerConnection* pc);
+
+ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
+
++/**
++ * @brief tell libpeer that the answer went out to the cloud (0037).
++ *
++ * The ICE connectivity check must not start before the answer is on the
++ * wire: the cloud cannot answer a check that arrives before it has
++ * processed our answer (it does not know our ICE credentials yet), and it
++ * drops it.  The engine calls this when the page reports that the answer
++ * has been sent over the signalling channel.
++ *
++ * If the report never arrives the check starts anyway after
++ * PEER_ANSWER_SENT_FALLBACK_MS, so a page that does not implement the
++ * report still connects.
++ *
++ * @param[in] pc   the peer connection
++ * @param[in] sent 1 = the answer is on the wire
++ */
++void peer_connection_set_answer_sent(PeerConnection* pc, int sent);
++
+ void peer_connection_set_local_description(PeerConnection* pc, const char* sdp, SdpType sdp_type);
+
+ const char* peer_connection_create_offer(PeerConnection* pc);
+diff --git a/src/socket.c b/src/socket.c
+index 239789e..ccc5d79 100644
+--- a/src/socket.c
++++ b/src/socket.c
+@@ -30,7 +30,14 @@ int udp_socket_add_multicast_group(UdpSocket* udp_socket, Address* mcast_addr) {
+ int udp_socket_open(UdpSocket* udp_socket, int family, int port) {
+   int ret;
+   int reuse = 1;
+-  int receive_buffer = 2 * 1024 * 1024;
++  // 0037: ask for 256 KiB, not 2 MiB.
++  //
++  // The 2 MiB request ALWAYS failed on the Switch (libnx hands out a ~42 KiB
++  // socket pool), and the failure path only logged a warning -- so the log
++  // never showed the real buffer size and the "media loss" could not be
++  // told apart from "the kernel dropped it".  256 KiB is still above what
++  // libnx can give, but the getsockopt() below now reports the real value.
++  int receive_buffer = 256 * 1024;
+   struct sockaddr* sa;
+   socklen_t sock_len;
+
+diff --git a/src/stun.c b/src/stun.c
+index d387241..2b552e1 100644
+--- a/src/stun.c
++++ b/src/stun.c
+@@ -123,6 +123,21 @@ void stun_get_mapped_address(char* value, uint8_t* mask, Address* addr) {
+   LOGD("XOR Mapped Address IP: %s (IP XOR: %08" PRIu32 ")", addr_string, *addr32);
+ }
+
++// 0037: read the 64 bit ICE tie breaker out of an attribute.
++//
++// RFC 8445 section 15: the ICE-CONTROLLING / ICE-CONTROLLED attribute is a
++// 64 bit value in NETWORK byte order.
++static uint64_t stun_read_tie_breaker(const StunAttribute* attr) {
++  uint64_t value = 0;
++  if (ntohs(attr->length) < 8) {
++    return 0;
++  }
++  for (int i = 0; i < 8; i++) {
++    value = (value << 8) | (uint8_t)attr->value[i];
++  }
++  return value;
++}
++
+ void stun_parse_msg_buf(StunMessage* msg) {
+   StunHeader* header = (StunHeader*)msg->buf;
+
+@@ -132,6 +147,15 @@ void stun_parse_msg_buf(StunMessage* msg) {
+
+   uint8_t mask[16];
+
++  // 0037: the ICE flags are reset here, because the callers hand in a
++  // STACK StunMessage whose bytes are never zeroed.
++  msg->has_use_candidate = 0;
++  msg->has_ice_controlling = 0;
++  msg->has_ice_controlled = 0;
++  msg->ice_tie_breaker = 0;
++  msg->has_priority = 0;
++  msg->priority = 0;
++
+   msg->stunclass = ntohs(header->type);
+   if ((msg->stunclass & STUN_CLASS_ERROR) == STUN_CLASS_ERROR) {
+     msg->stunclass = STUN_CLASS_ERROR;
+@@ -199,16 +223,33 @@ void stun_parse_msg_buf(StunMessage* msg) {
+         stun_get_mapped_address(attr->value, mask, &msg->mapped_addr);
+         break;
+       case STUN_ATTR_TYPE_PRIORITY:
++        // 0037: the PRIORITY of the check.  libwebrtc takes it AS IS for the
++        // peer reflexive candidate it builds from the request, so the
++        // candidate carries the priority the peer computed.
++        if (ntohs(attr->length) >= 4) {
++          memcpy(&msg->priority, attr->value, 4);
++          msg->priority = ntohl(msg->priority);
++          msg->has_priority = 1;
++        }
+         break;
+       case STUN_ATTR_TYPE_USE_CANDIDATE:
+-        // LOGD("Use Candidate");
++        // 0037: the peer nominates the pair this request arrived on.  The
++        // old code dropped the attribute on the floor, so the nomination of
++        // the ICE-CONTROLLING peer had NO effect on our side.
++        msg->has_use_candidate = 1;
+         break;
+       case STUN_ATTR_TYPE_FINGERPRINT:
+         memcpy(&msg->fingerprint, attr->value, ntohs(attr->length));
+         // LOGD("Fingerprint: 0x%.4x", msg->fingerprint);
+         break;
+       case STUN_ATTR_TYPE_ICE_CONTROLLED:
++        msg->has_ice_controlled = 1;
++        msg->ice_tie_breaker = stun_read_tie_breaker(attr);
++        break;
+       case STUN_ATTR_TYPE_ICE_CONTROLLING:
++        msg->has_ice_controlling = 1;
++        msg->ice_tie_breaker = stun_read_tie_breaker(attr);
++        break;
+       case STUN_ATTR_TYPE_NETWORK_COST:
+         // Do nothing
+         break;
+diff --git a/src/stun.h b/src/stun.h
+index 801133b..4b919b2 100644
+--- a/src/stun.h
++++ b/src/stun.h
+@@ -92,6 +92,18 @@ struct StunMessage {
+   char nonce[64];
+   Address mapped_addr;
+   Address relayed_addr;
++  // 0037: the ICE attributes used to be parsed and thrown away ("Do
++  // nothing"), so the nomination of the peer -- which is the ONLY way the
++  // controlled agent learns which pair is nominated -- had no effect at all.
++  int has_use_candidate;   // 1 = the message carries USE-CANDIDATE
++  int has_ice_controlling; // 1 = the message carries ICE-CONTROLLING
++  int has_ice_controlled;  // 1 = the message carries ICE-CONTROLLED
++  uint64_t ice_tie_breaker; // the peer's tie breaker (network byte order)
++  // 0037: the PRIORITY attribute of a connectivity check.  libwebrtc uses
++  // it AS IS for the peer reflexive candidate it builds from the request, so
++  // the priority of that candidate is the one the peer computed.
++  int has_priority;
++  uint32_t priority;
+   uint8_t buf[STUN_ATTR_BUF_SIZE];
+   size_t size;
+ };

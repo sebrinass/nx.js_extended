@@ -2,12 +2,15 @@
 // retries the mbedtls operation on each readiness event until it completes
 // (WANT_READ/WANT_WRITE -> keep polling). Same fd model as tcp.cc/udp.cc.
 #include "error.h"
+#include "nx_entropy.h"
 #include "types.h"
 #include "util.h"
 #include "wrap.h"
 #include <mbedtls/error.h>
 #include <mbedtls/net_sockets.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/ssl_ciphersuites.h>
+#include <mbedtls/ecp.h>
 #include <mbedtls/x509_crt.h>
 #include <stdio.h>
 #include <string.h>
@@ -488,8 +491,10 @@ void nx_tls_handshake(const FunctionCallbackInfo<Value> &info) {
 		mbedtls_entropy_init(&nx_ctx_->entropy);
 		mbedtls_ctr_drbg_init(&nx_ctx_->ctr_drbg);
 		const char *pers = "client";
+		// The Switch has no /dev/urandom, so mbedtls' platform entropy
+		// source cannot work: feed the DRBG from libnx' randomGet() instead.
 		int ret = mbedtls_ctr_drbg_seed(
-		    &nx_ctx_->ctr_drbg, mbedtls_entropy_func, &nx_ctx_->entropy,
+		    &nx_ctx_->ctr_drbg, nx_mbedtls_entropy_func, &nx_ctx_->entropy,
 		    (const unsigned char *)pers, strlen(pers));
 		if (ret != 0) {
 			iso->ThrowException(mbedtls_error(iso, ret));
@@ -526,6 +531,89 @@ void nx_tls_handshake(const FunctionCallbackInfo<Value> &info) {
 		iso->ThrowException(mbedtls_error(iso, ret));
 		return;
 	}
+	// ---- [tls] profile = browser: a browser-shaped ClientHello ----
+	//
+	// mbedTLS 2.28's stock PRESET_DEFAULT advertises EVERY enabled
+	// ciphersuite (dozens), sends NO ALPN extension, and can only speak
+	// TLS 1.2 (2.28's TLS 1.3 is MBEDTLS_SSL_PROTO_TLS1_3_EXPERIMENTAL and
+	// is off by default) -- so the ClientHello is trivially identifiable as
+	// "a mbedTLS client", which is a well-known TLS-fingerprint signature.
+	//
+	// What this profile DOES: a short, browser-like ciphersuite list + ALPN
+	// + a modern curve order.
+	// What it CANNOT do: mbedTLS hard-codes the extension SET/ORDER inside
+	// ssl_write_client_hello(), and there is no supported_versions extension
+	// without TLS 1.3 -- so this never becomes byte-identical to Chrome's
+	// ClientHello.  It only stops looking like stock mbedTLS.
+	if (nx_ctx_->config.tls_profile == NX_TLS_PROFILE_BROWSER) {
+		int nx_tls_ncipher = 0;
+#if defined(MBEDTLS_GCM_C) && (defined(MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED) || defined(MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED))
+		{
+			// The ECDHE + AES-GCM suites every modern browser offers.
+			// TLS 1.3 suites are intentionally absent: 2.28 has none.
+			static const int nx_tls_ciphers_tls12[] = {
+#if defined(MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA_ENABLED)
+				MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+				MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+#endif
+#if defined(MBEDTLS_KEY_EXCHANGE_ECDHE_RSA_ENABLED)
+				MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+				MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+#endif
+				0
+			};
+			// NOTE: the engine links **libpeer's own mbedTLS 3.4.0**
+			// (engine/Makefile:65/189/246 -- NOT portlibs' 2.28), and
+			// 3.x **removed** mbedtls_ssl_conf_ciphersuites_for_version()
+			// => use the 2.x/3.x-common mbedtls_ssl_conf_ciphersuites().
+			// The list must stay TLS-1.2-only: that build has
+			// MBEDTLS_SSL_PROTO_TLS1_3 **off**, and listing a TLS 1.3
+			// suite would be rejected by mbedtls_ssl_conf_ciphersuites().
+			mbedtls_ssl_conf_ciphersuites(&data->conf,
+			                              nx_tls_ciphers_tls12);
+			nx_tls_ncipher = (int)(sizeof(nx_tls_ciphers_tls12) /
+			                        sizeof(nx_tls_ciphers_tls12[0])) - 1;
+		}
+#endif
+		// TLS 1.0 / 1.1: nothing (browsers don't offer them either).
+		mbedtls_ssl_conf_min_version(&data->conf,
+		                             MBEDTLS_SSL_MAJOR_VERSION_3,
+		                             MBEDTLS_SSL_MINOR_VERSION_3);
+#if defined(MBEDTLS_SSL_ALPN)
+		{
+			static const char *nx_tls_alpn[] = { "http/1.1", NULL };
+			mbedtls_ssl_conf_alpn_protocols(&data->conf, nx_tls_alpn);
+		}
+#endif
+#if defined(MBEDTLS_ECP_C)
+		{
+			// Curve order matters for the JA3 "EllipticCurves" field.
+			static const mbedtls_ecp_group_id nx_tls_curves[] = {
+#if defined(MBEDTLS_ECP_DP_CURVE25519_ENABLED)
+				MBEDTLS_ECP_DP_CURVE25519,
+#endif
+#if defined(MBEDTLS_ECP_DP_SECP256R1_ENABLED)
+				MBEDTLS_ECP_DP_SECP256R1,
+#endif
+#if defined(MBEDTLS_ECP_DP_SECP384R1_ENABLED)
+				MBEDTLS_ECP_DP_SECP384R1,
+#endif
+				MBEDTLS_ECP_DP_NONE
+			};
+			mbedtls_ssl_conf_curves(&data->conf, nx_tls_curves);
+		}
+#endif
+		fprintf(stderr,
+		        "[tls] profile=browser ciphers=%d alpn=%s min=TLS1.2\n",
+		        nx_tls_ncipher,
+#if defined(MBEDTLS_SSL_ALPN)
+		        "http/1.1"
+#else
+		        "none"
+#endif
+		);
+	}
+
 	if (reject_unauthorized && nx_tls_load_ca_certs(nx_ctx_) == 0) {
 		mbedtls_ssl_conf_authmode(&data->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
 		mbedtls_ssl_conf_ca_chain(&data->conf, &nx_ctx_->ca_chain, NULL);

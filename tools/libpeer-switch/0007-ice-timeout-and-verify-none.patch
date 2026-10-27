@@ -1,0 +1,232 @@
+ICE give-up budget in wall clock and MBEDTLS_SSL_VERIFY_NONE for libpeer
+(extern/libpeer).
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place: the next `git submodule update` would throw the changes away.  This
+patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it is
+the seventh patch of that series, after 0001-switch-webrtc-fixes,
+0002-no-stdout-log, 0003-h265-depacketizer, 0004-dtls-diagnostics,
+0005-ice-roles-prflx-and-timing and 0006-dtls-fingerprint-and-verify).
+
+Why
+---
+1) The ICE give-up has to be a wall clock budget -- and the budget that
+   actually decided it was 5 s.
+
+   The cloud asked for `AGENT_CONNCHECK_MAX` 1000 -> 300 (agent.c:17),
+   because 1000 loop iterations are 47.6 s at the 21 fps the device really
+   runs at while 300 are 14.3 s (@30fps 10 s).  One ICE round has to
+   conclude in ~10-14 s, so that it does not fight the signalling retries
+   (3/9/15/20 s, ~47 s in total) -- "the two timers no longer fight".
+
+   0005 already replaced that FRAME COUNT with a wall clock deadline:
+   `AGENT_CONNCHECK_MAX` and `AGENT_CONNCHECK_SWITCH` are GONE, the
+   give-up of one pair is `AGENT_CONNCHECK_PAIR_TIMEOUT_MS` (15 s) and
+   "move on to the next pair" is `AGENT_CONNCHECK_PAIR_SWITCH_MS` (3 s).
+   So "1000 -> 300" has no referent any more -- in the wall clock world
+   the same request is a request for a ~14 s budget.
+
+   But the budget that actually ended the ICE was a THIRD one:
+   `PEER_ICE_CHECKING_TIMEOUT_MS` (peer_connection.c) was 5000 ms and it
+   is the watchdog of the whole CHECKING state.  5 s < 15 s, so the round
+   was cancelled long before the per pair budget could ever expire -- the
+   15 s was dead code and the EFFECTIVE give-up was 5 s, not 14 s.
+
+   This patch sets both budgets to 14 s:
+     * AGENT_CONNCHECK_PAIR_TIMEOUT_MS   15000 -> 14000   (one pair)
+     * PEER_ICE_CHECKING_TIMEOUT_MS       5000 -> 14000   (the whole round)
+
+   ★ The per pair switch stays at 3 s on purpose: libpeer checks ONE pair
+     at a time, and the cloud wants every candidate IP to be tried inside
+     ONE round (3-4 pairs x 3 s = 9-12 s < 14 s).  Making the switch as
+     long as the give-up would leave exactly ONE pair checked per round
+     and the parallel candidate list (all IPs at once) would be useless.
+
+   ★ The criterion really moves: both budgets are wall clock deadlines
+     (`now_ms - <the moment the pair was nominated>` and `now_ms -
+     <the moment CHECKING was entered>`), so they grow on every loop
+     iteration.  They are not constants that could sit at 0 and silently
+     disable the give-up.
+
+2) The certificate verification is switched off completely, and the
+   fingerprint stays the guard.
+
+   0006 kept `MBEDTLS_SSL_VERIFY_REQUIRED` and cleared the flags that the
+   official client does not care about.  The list of flags is OPEN
+   (MBEDTLS_X509_BADCERT_BAD_PURPOSE / BAD_KEY_USAGE / UNEXPECTED_CERT
+   ...), and mbedTLS 3.4.0 can also fail the verification with a hard
+   error that a flag clearing callback cannot fix at all.  The official
+   native client (BoringSSL with SSL_VERIFY_PEER and a verify callback of
+   its own) checks NEITHER the CA chain NOR the validity period -- it
+   only checks the fingerprint digest that the SDP announced.
+
+   The auth mode is `MBEDTLS_SSL_VERIFY_NONE` now.  ★ The fingerprint
+   comparison stays FAIL HARD (a mismatch, or a fingerprint that cannot
+   be parsed, aborts the handshake): "the X.509 chain is not verified" is
+   NOT "everything is accepted" -- the difference between the model of the
+   official client and no authentication at all.
+
+   ★ Under VERIFY_NONE the verify callback is no longer called, and that is
+     safe: it only ever cleared flags and did nothing else.  mbedTLS 3.4.0
+     proves it -- `mbedtls_ssl_parse_certificate()`
+     (third_party/mbedtls/library/ssl_tls.c) calls
+     `ssl_parse_certificate_verify()`, which returns 0 BEFORE it calls
+     f_vrfy when the auth mode is MBEDTLS_SSL_VERIFY_NONE.  The callback
+     is kept and stays registered as a safety net.
+
+   ★ The peer certificate is still available for the fingerprint check:
+     the chain is parsed and handed to the session
+     (`ssl->session_negotiate->peer_cert`) BEFORE the verification step,
+     and MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is enabled -- so
+     `mbedtls_ssl_get_peer_cert()` returns the certificate in either auth
+     mode and the fingerprint comparison is still the only guard.
+
+What it changes
+---------------
+1. src/agent.c
+     AGENT_CONNCHECK_PAIR_TIMEOUT_MS   15000 -> 14000
+2. src/peer_connection.c
+     PEER_ICE_CHECKING_TIMEOUT_MS       5000 -> 14000
+3. src/dtls_srtp.c
+     mbedtls_ssl_conf_authmode(..., MBEDTLS_SSL_VERIFY_REQUIRED)
+                                 -> MBEDTLS_SSL_VERIFY_NONE
+     (the verify callback is kept and stays registered as a safety net;
+      the fingerprint comparison stays fail hard)
+
+Note
+----
+This patch contains no key material of any kind.
+diff --git a/src/agent.c b/src/agent.c
+index 4e786f8..bfb8656 100644
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -31,7 +31,28 @@
+ // 1000 loop iterations, which is 16.7 s at 60 fps and 47.6 s at the 21 fps
+ // the device really runs at -- the "48 seconds without any reaction".
+ #define AGENT_CONNCHECK_PAIR_SWITCH_MS 3000
+-#define AGENT_CONNCHECK_PAIR_TIMEOUT_MS 15000
++
++// 0039: the give-up budget of ONE pair, in wall clock.
++//
++// 0037 already replaced the FRAME COUNT that used to live here
++// (`AGENT_CONNCHECK_MAX 1000`) with a wall clock deadline, so "1000 -> 300"
++// has no referent any more: the count was only a proxy for "give up after
++// about half a minute", and the proxy is gone.
++//
++// The cloud asked for the give-up to happen at 300 ticks instead of 1000,
++// because 1000 ticks are 47.6 s at the 21 fps the device really runs at
++// while 300 ticks are 14.3 s.  In the wall clock world that request is a
++// request for a ~14 s budget -- and that is what this constant is now.
++//
++// ★ The criterion really moves: `in_progress_ms` in
++//   agent_select_candidate_pair() is the wall clock since THIS pair was
++//   nominated, so it grows on every loop iteration.  It is not a constant
++//   that could sit at 0 and silently disable the give-up.
++//
++// ★ peer_connection.c carries the budget of the whole ICE round
++//   (PEER_ICE_CHECKING_TIMEOUT_MS).  The two have to agree: the shorter one
++//   wins and the other one is dead code.
++#define AGENT_CONNCHECK_PAIR_TIMEOUT_MS 14000
+
+ // 0037: how many datagrams one tick may take off the socket.
+ // (AGENT_RECV_DRAIN_MAX lives in agent.h: peer_connection.c drains too.)
+diff --git a/src/dtls_srtp.c b/src/dtls_srtp.c
+index ff6a956..af4c3de 100644
+--- a/src/dtls_srtp.c
++++ b/src/dtls_srtp.c
+@@ -83,10 +83,40 @@ static void dtls_srtp_x509_digest(const mbedtls_x509_crt* crt, char* buf) {
+ // of the cloud, so a certificate that is not valid YET (or not valid ANY
+ // MORE) must not break the handshake.
+ //
+-// The flags are cleared, the verification itself stays on: the alternative
+-// (MBEDTLS_SSL_VERIFY_NONE) would switch the certificate verification off
+-// COMPLETELY and leave the fingerprint as the only guard -- that is a bigger
+-// change and it is not needed here.
++// 0007: the verification is switched off COMPLETELY now
++// (MBEDTLS_SSL_VERIFY_NONE, see dtls_srtp_init()) instead of clearing a
++// fixed list of flags.
++//
++//   * WHY not "clear N flags": the list is open.  0006 cleared
++//     NOT_TRUSTED / CN_MISMATCH / BAD_KEY / EXPIRED / FUTURE, and
++//     MBEDTLS_X509_BADCERT_BAD_PURPOSE / BAD_KEY_USAGE /
++//     UNEXPECTED_CERT ... are just as possible on a certificate that the
++//     cloud happens to use.  A flag that is missed breaks the handshake.
++//     mbedTLS 3.4.0 can also fail the verification with a hard error that
++//     a flag clearing callback cannot fix at all.
++//
++//   * ★ The certificate is still authenticated -- by the FINGERPRINT.  The
++//     fingerprint comparison stays FAIL HARD: a mismatch or a fingerprint
++//     that cannot be parsed aborts the handshake (dtls_srtp_handshake()
++//     returns -1).  "The X.509 chain is not verified" must NOT become
++//     "everything is accepted" -- that would open the door for a man in
++//     the middle.  This is the difference between the model of the official
++//     native client (no CA chain, no validity period, only the SDP
++//     fingerprint) and "no authentication at all".
++//
++// ★ This callback is NOT called any more: with MBEDTLS_SSL_VERIFY_NONE
++//   mbedtls_ssl_parse_certificate() -> ssl_parse_certificate_verify()
++//   returns 0 BEFORE it calls f_vrfy (third_party/mbedtls/library/
++//   ssl_tls.c).  That is safe: the callback only ever cleared flags and did
++//   nothing else.  It is kept and stays registered as a safety net in case
++//   the auth mode is ever switched back to MBEDTLS_SSL_VERIFY_REQUIRED.
++//
++// ★ The peer certificate is still there for the fingerprint check: the
++//   chain is parsed and handed to the session
++//   (ssl->session_negotiate->peer_cert) BEFORE the verification step, and
++//   MBEDTLS_SSL_KEEP_PEER_CERTIFICATE is enabled, so
++//   mbedtls_ssl_get_peer_cert() returns the certificate in either auth
++//   mode.  The fingerprint comparison is therefore still the guard.
+ static int dtls_srtp_cert_verify(void* data, mbedtls_x509_crt* crt, int depth, uint32_t* flags) {
+   *flags &= ~(MBEDTLS_X509_BADCERT_NOT_TRUSTED | MBEDTLS_X509_BADCERT_CN_MISMATCH | MBEDTLS_X509_BADCERT_BAD_KEY);
+ #ifdef MBEDTLS_X509_BADCERT_EXPIRED
+@@ -227,7 +257,17 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
+
+   mbedtls_ssl_conf_verify(&dtls_srtp->conf, dtls_srtp_cert_verify, NULL);
+
+-  mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_REQUIRED);
++  // 0007: no X.509 verification at all -- the fingerprint that the SDP
++  // announced is the only guard, exactly like the official native client
++  // (BoringSSL + SSL_VERIFY_PEER + a verify callback of its own that only
++  // checks the fingerprint digest).
++  //
++  // ★ The fingerprint comparison stays FAIL HARD: a mismatch or a
++  //   fingerprint that cannot be parsed aborts the handshake, so this is
++  //   "the CA chain and the validity period are not checked", NOT
++  //   "everything is accepted".  See the comment above
++  //   dtls_srtp_cert_verify().
++  mbedtls_ssl_conf_authmode(&dtls_srtp->conf, MBEDTLS_SSL_VERIFY_NONE);
+
+   mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
+
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index 7f11e10..e8cde47 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -32,8 +32,24 @@
+ // Before this the CHECKING state had no timeout at all: with an empty
+ // candidate pair table peer_connection_loop() just `break`ed and the peer
+ // connection stayed in "checking" forever (the "48 seconds without any
+-// reaction").  5 s is generous for a connectivity check round trip.
+-#define PEER_ICE_CHECKING_TIMEOUT_MS 5000
++// reaction").
++//
++// 0039: 5 s was too short, because this is the budget that actually decides
++// the give-up.  agent_select_candidate_pair() hands out ONE pair at a time
++// and the per pair budget (AGENT_CONNCHECK_PAIR_TIMEOUT_MS) is 14 s, so a
++// 5 s watchdog cancelled the round before the per pair budget could ever
++// expire -- the 15 s budget was dead code.
++//
++// 14 s is the wall clock equivalent of the "300 ticks" the cloud asked for
++// (300 ticks are 14.3 s at the 21 fps the device really runs at, 10 s at
++// 30 fps).  One ICE round now concludes in ~10-14 s, which is the same
++// order of magnitude as the signalling retries (3/9/15/20 s, ~47 s in
++// total) -- the two timers no longer fight each other.
++//
++// ★ The criterion really moves: it is the wall clock since the CHECKING
++//   state was entered (reset for every new answer and every new remote),
++//   not a counter that could be stuck.
++#define PEER_ICE_CHECKING_TIMEOUT_MS 14000
+
+ // 0037: how often the CHECKING diagnostic is repeated (ms).
+ #define PEER_ICE_CHECKING_DIAG_INTERVAL_MS 1000

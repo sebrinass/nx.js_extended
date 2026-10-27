@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -32,6 +33,7 @@
 #include "util.h"
 #include "webgl.h"
 #include "webgl_bridge.h"
+#include "webrtc.h"
 
 #include "include/core/SkMilestone.h"
 #include "include/core/SkSurface.h"
@@ -72,6 +74,7 @@ NX_MODULE(memory);
 NX_MODULE(nfc);
 NX_MODULE(nifm);
 NX_MODULE(ns);
+NX_MODULE(opus_decoder);
 NX_MODULE(path2d);
 NX_MODULE(sensors);
 NX_MODULE(service);
@@ -85,12 +88,22 @@ NX_MODULE(usb);
 NX_MODULE(video);
 NX_MODULE(video_decoder);
 NX_MODULE(web);
+NX_MODULE(webcodecs);
 NX_MODULE(window);
 #undef NX_MODULE
 
 using namespace v8;
 
 #define LOG_FILENAME "nxjs-debug.log"
+// Timestamped archive of the very same log (patch 0019):
+//   "nxjs-debug-<YYYYMMDD-HHMMSS>.log"
+#define LOG_TS_PREFIX "nxjs-debug-"
+#define LOG_TS_SUFFIX ".log"
+// First line of every log: "[log] run <YYYYMMDD-HHMMSS>" -- the next
+// run reads it back to name this run's archive.
+#define LOG_RUN_MARKER "[log] run "
+#define LOG_TS_MAX 32
+#define LOG_PATH_MAX 128
 
 // ---- Video frame-timing diagnostic (Jellyfin 720p hitch localization) ------
 // Localizes the periodic 720p video hitch (fps bounces 23<->31, interval prop
@@ -366,6 +379,209 @@ static bool g_emergency_teardown_started = false;
 static FILE *g_debug_fd = NULL;
 
 // ---------------------------------------------------------------------------
+// Timestamped debug log (patch 0019)
+//
+// The engine's stderr log used to be ONE fixed name ("nxjs-debug.log")
+// opened with mode "w" -> every app launch TRUNCATED it. A batch run of
+// several apps therefore left only the LAST app's log on the card; that is
+// exactly how the 0013 "[nvd]" diagnostics got lost (see
+// reports/device/2026-10-22/README.md, "⚠️ 复现时必须知道").
+//
+// Since 0019:
+//   * the PREVIOUS run's log is archived as "nxjs-debug-<YYYYMMDD-HHMMSS>.log"
+//     when the next run starts -> runs never overwrite each other;
+//   * the legacy "nxjs-debug.log" stays the LIVE mirror of the CURRENT run,
+//     so every existing reference (build scripts, handoff docs, the apps'
+//     "look at sdmc:/switch/nxjs-debug.log" instructions) keeps working
+//     unchanged -- also for a crashed run, where the mirror still holds the
+//     partial log;
+//   * the archive of the CURRENT run is written when the run ends.
+//
+// The stamp is local wall-clock time in "YYYYMMDD-HHMMSS" -- the same style
+// the facade uses for its own logs (facade/src/logging/sinks/file.ts:
+// formatSessionStamp) and the same style as reports/build/<timestamp>.log.
+// ---------------------------------------------------------------------------
+
+// Stamp of the current run; empty until the log is opened.
+static char g_log_ts[LOG_TS_MAX];
+
+// Format a time_t as local wall clock "YYYYMMDD-HHMMSS".
+static void log_format_time(time_t t, char *out, size_t n) {
+	struct tm parts;
+	struct tm *tp = localtime(&t);
+	if (!tp) {
+		snprintf(out, n, "00000000-000000");
+		return;
+	}
+	parts = *tp;
+	snprintf(out, n, "%04d%02d%02d-%02d%02d%02d", parts.tm_year + 1900,
+			 parts.tm_mon + 1, parts.tm_mday, parts.tm_hour, parts.tm_min,
+			 parts.tm_sec);
+}
+
+// True when the path exists.
+static bool log_file_exists(const char *path) {
+	struct stat st;
+	return stat(path, &st) == 0;
+}
+
+// Size of a file in bytes (-1 when it cannot be opened).
+static long log_file_size(const char *path) {
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return -1;
+	fseek(f, 0, SEEK_END);
+	long size = ftell(f);
+	fclose(f);
+	return size;
+}
+
+// "nxjs-debug-<ts>.log" -> out. False when it does not fit.
+static bool log_ts_path(char *out, size_t n, const char *ts) {
+	int w = snprintf(out, n, "%s%s%s", LOG_TS_PREFIX, ts, LOG_TS_SUFFIX);
+	return w > 0 && (size_t)w < n;
+}
+
+// An unused archive path for this stamp: "nxjs-debug-<ts>.log", or
+// "nxjs-debug-<ts>-2.log" when that one is taken (two runs inside the same
+// second).
+static bool log_free_ts_path(char *out, size_t n, const char *ts) {
+	char cand[LOG_PATH_MAX];
+	for (int i = 1; i < 1000; i++) {
+		int w;
+		if (i == 1)
+			w = snprintf(cand, sizeof(cand), "%s%s%s", LOG_TS_PREFIX, ts,
+						 LOG_TS_SUFFIX);
+		else
+			w = snprintf(cand, sizeof(cand), "%s%s-%d%s", LOG_TS_PREFIX, ts,
+						 i, LOG_TS_SUFFIX);
+		if (w <= 0 || (size_t)w >= sizeof(cand))
+			return false;
+		if (!log_file_exists(cand)) {
+			if ((size_t)snprintf(out, n, "%s", cand) >= n)
+				return false;
+			return true;
+		}
+	}
+	return false;
+}
+
+// Read the stamp of a log written by this engine build: the first line starts
+// with "[log] run <YYYYMMDD-HHMMSS>".
+static bool log_read_run_stamp(const char *path, char *out, size_t n) {
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return false;
+	char line[160];
+	bool found = false;
+	if (fgets(line, sizeof(line), f)) {
+		const char *p = strstr(line, LOG_RUN_MARKER);
+		if (p) {
+			p += strlen(LOG_RUN_MARKER);
+			size_t i = 0;
+			while (i + 1 < n && p[i] && p[i] != '\r' && p[i] != '\n' &&
+				   p[i] != ' ' && p[i] != '\t') {
+				out[i] = p[i];
+				i++;
+			}
+			out[i] = '\0';
+			found = i > 0;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+// Copy a file byte for byte. True on success.
+static bool log_copy_file(const char *src, const char *dst) {
+	FILE *in = fopen(src, "rb");
+	if (!in)
+		return false;
+	FILE *out = fopen(dst, "wb");
+	if (!out) {
+		fclose(in);
+		return false;
+	}
+	char buf[4096];
+	size_t n;
+	bool ok = true;
+	while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+		if (fwrite(buf, 1, n, out) != n) {
+			ok = false;
+			break;
+		}
+	}
+	if (fclose(out) != 0)
+		ok = false;
+	fclose(in);
+	if (!ok)
+		remove(dst);
+	return ok;
+}
+
+// Archive the CURRENT run's log under its timestamped name. Called on the
+// way out (normal exit AND the fatal/emergency teardown).
+static void log_archive_current_run(void) {
+	if (g_log_ts[0] == '\0')
+		return;
+	if (log_file_size(LOG_FILENAME) <= 0)
+		return; // nothing was logged -> nothing worth archiving
+	char archive[LOG_PATH_MAX];
+	if (!log_free_ts_path(archive, sizeof(archive), g_log_ts))
+		return;
+	if (!log_copy_file(LOG_FILENAME, archive))
+		fprintf(stderr, "[log] could not archive this run as %s\n", archive);
+}
+
+// Move the PREVIOUS run's legacy log aside so this run cannot overwrite it.
+// MUST run before the legacy log is re-opened (which truncates it).
+static void log_rotate_previous_run(void) {
+	if (!log_file_exists(LOG_FILENAME))
+		return;
+	if (log_file_size(LOG_FILENAME) <= 0) {
+		remove(LOG_FILENAME); // empty legacy log -> drop it (legacy rule)
+		return;
+	}
+	char prev[LOG_TS_MAX];
+	if (!log_read_run_stamp(LOG_FILENAME, prev, sizeof(prev))) {
+		// Written by an engine build without the run marker -> fall back to
+		// the file's mtime (when that run last wrote to it).
+		struct stat st;
+		if (stat(LOG_FILENAME, &st) == 0)
+			log_format_time(st.st_mtime, prev, sizeof(prev));
+		else
+			log_format_time(time(NULL), prev, sizeof(prev));
+	}
+	char target[LOG_PATH_MAX];
+	if (!log_ts_path(target, sizeof(target), prev))
+		return;
+	if (log_file_exists(target)) {
+		// Same stamp already archived (that run ended cleanly and its
+		// archive was written on the way out) -> the legacy file is a
+		// duplicate of it: drop the duplicate, keep the archive.
+		long legacy = log_file_size(LOG_FILENAME);
+		long archived = log_file_size(target);
+		if (legacy >= 0 && legacy == archived) {
+			remove(LOG_FILENAME);
+			return;
+		}
+		// Different content with the same stamp (two runs inside the same
+		// second) -> keep both.
+		if (!log_free_ts_path(target, sizeof(target), prev))
+			return;
+	}
+	if (rename(LOG_FILENAME, target) != 0) {
+		// FAT32 refuses to rename onto an existing file -> fall back to a
+		// copy (which overwrites).
+		if (!log_copy_file(LOG_FILENAME, target)) {
+			fprintf(stderr, "[log] could not archive the previous run\n");
+			return;
+		}
+		remove(LOG_FILENAME);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Sleep / resume fix.
 //
 // On Switch sleep the bsdsocket layer is torn down, invalidating ALL sockets —
@@ -519,9 +735,18 @@ static void nx_emergency_teardown(void) {
 		g_socket_initialized = false;
 	}
 	if (g_debug_fd) {
+		fflush(g_debug_fd);
+		// Fatal path: archive the log under its timestamped name before it
+		// goes away (patch 0019) -- the legacy mirror keeps it too.
+		log_archive_current_run();
 		fclose(g_debug_fd);
 		g_debug_fd = NULL;
 	}
+	// Patch 0051: best-effort keep-awake restore on the fatal path too (same
+	// rationale as the normal teardown below; service calls here run while
+	// the address space is still intact, before nx_teardown_mman_once).
+	appletSetMediaPlaybackState(false);
+	appletSetAutoSleepDisabled(false);
 	nx_teardown_mman_once();
 }
 
@@ -1216,6 +1441,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_nfc(iso, init_obj);
 	nx_init_nifm(iso, init_obj);
 	nx_init_ns(iso, init_obj);
+	nx_init_opus_decoder(iso, init_obj);
 	nx_init_path2d(iso, init_obj);
 	nx_init_sensors(iso, init_obj);
 	nx_init_service(iso, init_obj);
@@ -1227,9 +1453,11 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_url(iso, init_obj);
 	nx_init_usb(iso, init_obj);
 	nx_init_video(iso, init_obj);
+	nx_init_webcodecs(iso, init_obj);
 	nx_init_video_decoder(iso, init_obj);
 	nx_init_web(iso, init_obj);
 	nx_init_webgl(iso, init_obj);
+	nx_init_webrtc(iso, init_obj);
 	nx_init_window(iso, init_obj);
 	nx_module_bindings(iso, init_obj);
 
@@ -1698,7 +1926,19 @@ int main(int argc, char *argv[]) {
 	// config parse) so that `[config]`/`[v8]`/`[skia]` diagnostics — including
 	// any "value not honored" lines from the nxjs.ini parse below — are
 	// captured to sdmc:/switch/nxjs-debug.log.
+	//
+	// Patch 0019: the legacy name stays the LIVE mirror of THIS run (so
+	// every existing reference keeps working), and the PREVIOUS run's log
+	// is archived under its own timestamped name first -- a batch run of
+	// several apps no longer overwrites the logs of the earlier ones.
+	log_rotate_previous_run();
+	log_format_time(time(NULL), g_log_ts, sizeof(g_log_ts));
 	g_debug_fd = freopen(LOG_FILENAME, "w", stderr);
+	// First line of every log: which run this file belongs to. The next
+	// run reads it back to name this run's archive.
+	fprintf(stderr, "%s%s (archive %s%s%s)\n", LOG_RUN_MARKER, g_log_ts,
+	        LOG_TS_PREFIX, g_log_ts, LOG_TS_SUFFIX);
+	fflush(stderr);
 
 	// Take a process-lifetime nvdrv reference NOW, while memory is plentiful.
 	// The libnx PrintConsole/Framebuffer stack nvInitialize()/nvExit()s around
@@ -2600,10 +2840,22 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (g_debug_fd) {
+		fflush(g_debug_fd);
+		// Archive this run's log under its timestamped name (patch 0019);
+		// the legacy name stays the live mirror of the current run.
+		log_archive_current_run();
 		fclose(g_debug_fd);
 		g_debug_fd = NULL;
 	}
 	delete_if_empty(LOG_FILENAME);
+
+	// Patch 0051: clear the keep-awake state an app may have left on
+	// (Switch.setKeepAwake(true) while queueing / in game), so returning to
+	// hbmenu does not hold the display awake. Best-effort: rc is ignored.
+	// The applet service session itself is finalized by __appExit after
+	// main() returns, so the service is still alive here.
+	appletSetMediaPlaybackState(false);
+	appletSetAutoSleepDisabled(false);
 
 	// CRITICAL: V8 maps its arenas via manual
 	// svcMapMemory, which libnx's NRO exit does NOT unmap. Release them as the

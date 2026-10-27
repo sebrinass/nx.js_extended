@@ -710,6 +710,27 @@ static inline Result socketInitialize(const SocketInitConfig *config) {
 static inline void socketExit(void) {}
 
 // ============================================================================
+// Native WebRTC (source/webrtc.cc)
+// ============================================================================
+//
+// NOTE: the WebRTC module is PORTABLE, so it is compiled into the host test
+// binary (see packages/runtime/test/CMakeLists.txt) and needs NO new libnx
+// stubs here.
+//
+// What IS device-only is the backend (source/webrtc_backend_libpeer.cc):
+// it needs libpeer + a devkitPro mbedtls with MBEDTLS_SSL_DTLS_SRTP, so the
+// host build uses packages/runtime/test/src/webrtc-backend-stub.cc instead
+// (same C ABI, fake behaviour).
+//
+// The backend opens its UDP sockets through libpeer's own BSD-socket code
+// (src/socket.c, src/ports.c), which on the Switch needs socketInitialize()
+// to have run -- the device runtime already does that in source/main.cc
+// before any module is initialised.
+//
+// If a future revision of the module starts calling a libnx API directly,
+// add the stub HERE (this file) and keep the device/host behaviour in sync.
+
+// ============================================================================
 // RomFS (used by main.c)
 // ============================================================================
 

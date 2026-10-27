@@ -584,6 +584,12 @@ void nx_image_write_rgba(const FunctionCallbackInfo<Value> &info) {
 	// createImageBitmap(imageBitmap, opts) can convert correctly instead
 	// of losing alpha=0 pixels' RGB channels through a canvas round-trip.
 	image->unpremultiplied = !premultiply;
+	// ★ 0031: 写 RGBA/BGRA **必须**清掉 is_yuv ——
+	//   否则一个「曾经写过 YUV」的 image 对象在被覆写成 BGRA 之后，
+	//   下游（canvas.cc 的 drawImage）仍会按 YUVA 解释它的数据
+	//   ⇒ **把 BGRA 当 YUV 采样** ⇒ 花屏 / 色度错位。
+	//   （:674 的注释早就承诺会清，实际没清 ⇒ 注释与实现不一致。）
+	image->is_yuv = false;
 	uint8_t *dst = image->data;
 	size_t pixels = (size_t)image->width * (size_t)image->height;
 	for (size_t i = 0; i < pixels; i++) {
@@ -660,6 +666,8 @@ void nx_image_write_bgra(const FunctionCallbackInfo<Value> &info) {
 		return;
 	}
 	image->unpremultiplied = false; // opaque BGRA == premultiplied BGRA
+	// ★ 0031: 同上 —— 写 BGRA 必须清 is_yuv（见 imageWriteRGBA 处的说明）。
+	image->is_yuv = false;
 	memcpy(image->data, src, expected);
 	// Same cache invalidation rationale as imageWriteRGBA above.
 	nx_image_release_cache(image);
@@ -749,6 +757,20 @@ void nx_image_copy_pixels(const FunctionCallbackInfo<Value> &info) {
 	    dst->width != src->width || dst->height != src->height) {
 		nx_throw(iso,
 		         "imageCopyPixels: dst must be allocated at src dimensions");
+		return;
+	}
+	// ★ 0031: **YUV 源不能走这条路**。
+	//   本函数按 `W * 4` 逐行读源（BGRA/premul 布局），而平面 I420 只有
+	//   `W * H * 1.5` 字节 ⇒ 读到最后一行就越界 ⇒ 花屏 + 越界写。
+	//   本函数的契约是「premul ↔ unpremul 的 BGRA 拷贝」⇒ YUV 源不在契约内
+	//   ⇒ 明确报错，别悄悄越界。
+	//   （下游的 YUV→RGB 有两条正路：canvas.cc 的 TextureFromYUVAPixmaps，
+	//     或 imageWriteYUV 之后直接用。）
+	if (src->is_yuv) {
+		nx_throw(iso,
+		         "imageCopyPixels: source is a YUV image (planar I420, "
+		         "1.5 B/px) — convert it first (the copy path assumes "
+		         "4 B/px BGRA)");
 		return;
 	}
 	const bool dst_premultiply = info[2]->BooleanValue(iso);

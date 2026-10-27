@@ -27,6 +27,7 @@
 #include <math.h>
 #include <mbedtls/base64.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <turbojpeg.h>
@@ -2515,6 +2516,86 @@ static SkSamplingOptions sampling_for(nx_canvas_context_2d_t *context) {
 	}
 }
 
+// [canvas] yuv_convert = cpu —— CPU 路径：把平面 I420 展开成 BGRA，
+// 绕开 Skia 的 GPU YUVA 纹理（SkImages::TextureFromYUVAPixmaps）。
+//
+// 系数、色彩空间选择器、字节序（BGRA，alpha=255）与 `source/webgl.cc` 的
+// `expand_yuv_image_to_bgra()` **完全一致** —— 同一个 `img->yuv_colorspace`
+// 标签 ⇒ 同一个 SkYUVColorSpace ⇒ 与 canvas 现有的 GPU 路径色彩一致，
+// 不引入色偏。
+//
+// 为什么在 canvas.cc 里写一份，而不是把 webgl.cc 那个 static 函数提到共享
+// 位置：见 patches/0030-NOTES.md（改动面最小 ⇒ 不碰 WebGL 那条已经调通的
+// 视频纹理路径）。
+//
+// ⚠️ 不能就地写回 img->data：`<video>` 路径的缓冲只有 I420 那么大
+//（video.cc 用 nx_media_i420_size(w,h) 分配 = 1.5 B/px），4 B/px 的 BGRA
+// 会直接越界 ⇒ 必须用独立的临时缓冲。
+static sk_sp<SkImage> expand_yuv_to_bgra_image(const nx_image_t *img) {
+	const uint32_t W = img->width;
+	const uint32_t H = img->height;
+	const uint32_t CW = (W + 1) / 2;
+	const uint32_t CH = (H + 1) / 2;
+	const uint8_t *Yp = img->data;
+	const uint8_t *Up = Yp + (size_t)W * (size_t)H;
+	const uint8_t *Vp = Up + (size_t)CW * (size_t)CH;
+	// R = (yg*(Y-yoff) + rv*E           + 128) >> 8
+	// G = (yg*(Y-yoff) - gu*D   - gv*E  + 128) >> 8
+	// B = (yg*(Y-yoff) + bu*D           + 128) >> 8   (D = U-128, E = V-128)
+	// Selector matches canvas.cc's SkYUVColorSpace switch on the same tag.
+	int yoff = 16, yg = 298, rv = 459, gu = 55, gv = 136, bu = 541; // 709 ltd
+	switch (img->yuv_colorspace) {
+	case 1: yoff = 16; yg = 298; rv = 409; gu = 100; gv = 208; bu = 516; break;
+	case 2: yoff = 0;  yg = 256; rv = 359; gu = 88;  gv = 183; bu = 454; break;
+	case 3: yoff = 0;  yg = 256; rv = 403; gu = 48;  gv = 120; bu = 475; break;
+	default: break;
+	}
+	// 一次性日志：让设备日志自证这一轮跑的是 CPU 臂（A/B 要靠它确认开关
+	// 真的生效，而不是 INI 写错/没被读到）。
+	static bool logged = false;
+	if (!logged) {
+		logged = true;
+		fprintf(stderr,
+		        "[canvas] yuv_convert=cpu - planar I420 -> BGRA on CPU "
+		        "(patches/0030)\n");
+		fflush(stderr);
+	}
+	// 临时缓冲：thread_local ⇒ 跨帧复用容量（720p 每帧省掉一次 3.6 MB 的
+	// malloc/free）；RasterFromPixmapCopy 会把像素复制进自己的 SkData，
+	// 所以下一帧覆写这个缓冲不影响已经建好的 SkImage。
+	static thread_local std::vector<uint8_t> scratch;
+	const size_t need = (size_t)W * (size_t)H * 4;
+	if (scratch.size() < need)
+		scratch.resize(need);
+	uint8_t *dst = scratch.data();
+	for (uint32_t y = 0; y < H; ++y) {
+		const uint8_t *yrow = Yp + (size_t)y * (size_t)W;
+		const uint8_t *urow = Up + (size_t)(y / 2) * (size_t)CW;
+		const uint8_t *vrow = Vp + (size_t)(y / 2) * (size_t)CW;
+		uint8_t *drow = dst + (size_t)y * (size_t)W * 4;
+		for (uint32_t x = 0; x < W; ++x) {
+			const int c = yg * ((int)yrow[x] - yoff);
+			const int d = (int)urow[x / 2] - 128;
+			const int e = (int)vrow[x / 2] - 128;
+			const int r = (c + rv * e + 128) >> 8;
+			const int g = (c - gu * d - gv * e + 128) >> 8;
+			const int b = (c + bu * d + 128) >> 8;
+			// BGRA byte order, opaque. Alpha 255 means "premultiplied" and
+			// "straight" coincide (same note as webgl.cc).
+			drow[x * 4 + 0] = (uint8_t)(b < 0 ? 0 : (b > 255 ? 255 : b));
+			drow[x * 4 + 1] = (uint8_t)(g < 0 ? 0 : (g > 255 ? 255 : g));
+			drow[x * 4 + 2] = (uint8_t)(r < 0 ? 0 : (r > 255 ? 255 : r));
+			drow[x * 4 + 3] = 255;
+		}
+	}
+	// 走 canvas.cc **已有的 BGRA 分支**那套构造：kBGRA_8888 + kPremul，
+	// rowBytes = W*4（tight）。
+	SkImageInfo ii = SkImageInfo::Make(W, H, kBGRA_8888_SkColorType,
+	                                   kPremul_SkAlphaType);
+	SkPixmap pm(ii, dst, (size_t)W * 4);
+	return SkImages::RasterFromPixmapCopy(pm);
+}
+
 void nx_canvas_context_2d_draw_image(const FunctionCallbackInfo<Value> &info) {
 	Isolate *iso = info.GetIsolate();
 	int argc = info.Length();
@@ -2556,7 +2637,16 @@ void nx_canvas_context_2d_draw_image(const FunctionCallbackInfo<Value> &info) {
 		// in close_image via nx_image_release_cache.
 		if (!img->cached_sk_image) {
 			sk_sp<SkImage> cached;
-			if (img->is_yuv) {
+			// [canvas] yuv_convert：平面 I420 → RGB 在哪做。默认 gpu ⇒
+			// Skia 的 GPU YUVA 纹理（与既有行为完全一致）；cpu ⇒ 在 CPU
+			// 上展开成 BGRA，再走**已有的 BGRA 分支**。见 patches/0030-NOTES.md。
+			const bool yuv_cpu =
+			    img->is_yuv &&
+			    nx_ctx(iso)->config.canvas_yuv_convert ==
+			        NX_CANVAS_YUV_CONVERT_CPU;
+			if (yuv_cpu) {
+				cached = expand_yuv_to_bgra_image(img);
+			} else if (img->is_yuv) {
 				// Planar-I420 video frame (2026-09-06): upload the Y/U/V
 				// planes as a GPU YUVA image (Skia does YUV→RGB in the
 				// shader). This transfers ~1.5 B/px vs BGRA's 4 B/px — the

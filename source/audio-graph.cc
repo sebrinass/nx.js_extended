@@ -3,6 +3,7 @@
 // runtime and the host nxjs-test binary.
 #include "audio-graph.h"
 #include <algorithm>
+#include <stdio.h>
 #include <string.h>
 
 namespace {
@@ -469,15 +470,62 @@ void process_stream_source(nx_audio_graph *g, nx_audio_node *n) {
 	uint32_t avail = (uint32_t)(write - read);
 	uint32_t frames = avail < (uint32_t)Q ? avail : (uint32_t)Q;
 	const float *ring = n->stream_ring.get();
+	// B1 (0071): the PLC envelope. `gain` < 1 means output is still coming
+	// back from a concealed gap; real frames ramp it to 1.0 (~2.7 ms at the
+	// render quantum) so resumed audio glides in instead of clicking against
+	// the decayed tail below.
+	float gain = n->stream_conceal_gain;
 	for (uint32_t i = 0; i < frames; i++) {
 		uint32_t idx = (uint32_t)((read + i) % n->stream_capacity);
-		n->bus[0][i] = ring[idx * 2];
-		n->bus[1][i] = ring[idx * 2 + 1];
+		float l = ring[idx * 2];
+		float r = ring[idx * 2 + 1];
+		if (gain < 1.f) {
+			gain += 1.f / (float)Q;
+			if (gain > 1.f)
+				gain = 1.f;
+			l *= gain;
+			r *= gain;
+		}
+		n->bus[0][i] = l;
+		n->bus[1][i] = r;
 	}
-	// Underrun: the remainder of the bus stays silent and is NOT counted as
-	// consumed, so the media clock only advances for real audio.
-	if (avail < (uint32_t)Q)
+	if (frames > 0) {
+		// Remember the last real frame so a short quantum can hold it instead
+		// of dropping to silence (see below).
+		uint32_t last_idx = (uint32_t)((read + frames - 1) % n->stream_capacity);
+		n->stream_last_frame[0] = ring[last_idx * 2];
+		n->stream_last_frame[1] = ring[last_idx * 2 + 1];
+	}
+	// Underrun (B1, 0071): pad the remainder of the bus with the last frame
+	// under a DECAYING envelope -- x0.8 every 8 frames (0065's concealment
+	// curve, gone in ~5 ms), then exact silence.  0059 held the frame at FULL
+	// amplitude, which on device buzzed like a stuck tape every time the ring
+	// ran short; a decaying hold keeps the waveform continuous across a tiny
+	// hole (real NetEQ PLC behavior) while a long hole deflates to a clean
+	// gap instead of a drone.  The pad frames are NOT counted as consumed, so
+	// the media clock only advances for real audio.
+	for (uint32_t i = frames; i < (uint32_t)Q; i++) {
+		if (gain > 0.f) {
+			if (((i - frames) % 8) == 0)
+				gain *= 0.8f;
+			if (gain < 1.f / 256.f)
+				gain = 0.f;
+		}
+		n->bus[0][i] = n->stream_last_frame[0] * gain;
+		n->bus[1][i] = n->stream_last_frame[1] * gain;
+	}
+	n->stream_conceal_gain = gain;
+	// Diagnostic contract unchanged: quanta that needed padding still count.
+	if (avail < (uint32_t)Q) {
 		n->stream_underrun_count.fetch_add(1, std::memory_order_relaxed);
+		// One-shot stderr self-proof (0071): greppable in the built .nro to
+		// prove this underrun path shipped.
+		static bool announced = false;
+		if (!announced) {
+			announced = true;
+			fprintf(stderr, "[audio-plc] underrun_mode=decay-fade 0071\n");
+		}
+	}
 	n->stream_read_pos.store(read + frames, std::memory_order_release);
 	(void)g;
 }
@@ -1922,6 +1970,10 @@ uint32_t nx_audio_stream_pending(nx_audio_node *n) {
 
 uint64_t nx_audio_stream_underrun_count(nx_audio_node *n) {
 	return n->stream_underrun_count.load(std::memory_order_relaxed);
+}
+
+uint32_t nx_audio_stream_capacity(nx_audio_node *n) {
+	return n ? n->stream_capacity : 0;
 }
 
 void nx_audio_stream_flush(nx_audio_node *n) {

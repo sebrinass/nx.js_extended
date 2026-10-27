@@ -1,0 +1,657 @@
+DTLS / ICE diagnostics for libpeer (extern/libpeer).
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place: the next `git submodule update` would throw the changes away.  This
+patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it is
+the fourth patch of that series, after 0001-switch-webrtc-fixes,
+0002-no-stdout-log and 0003-h265-depacketizer).
+
+Why
+---
+The engine could not tell WHY a DTLS handshake failed:
+
+  * peer_connection_loop() kept the handshake's return code in a LOCAL
+    variable (`dtls_ret`).  It died with the stack frame, and the only
+    trace was a LOGE() that 0022 had turned off.
+  * `lastDtlsWrite` (the stat the engine exposed) comes from
+    dtls_srtp_write() -- that is the SCTP payload write, NOT the handshake.
+  * libpeer's own diagnostic channel (peer_connection_diag_log(): dtls_start,
+    dtls_pending ret=<code>, ice_pair[..], ice_consent) needs BOTH a
+    callback and the "enabled" flag.  The engine set neither, so the whole
+    DTLS/ICE story was invisible.
+
+What it adds
+------------
+1. src/dtls_srtp.h / src/dtls_srtp.c -- the handshake verdict survives:
+
+     last_mbedtls_ret      raw return code of the last
+                           mbedtls_ssl_handshake() step
+     fingerprint_check     0 unknown / 1 match / -1 mismatch /
+                           -2 no peer certificate
+     handshake_active      1 while mbedtls_ssl_handshake() runs
+     last_write_is_handshake
+                           1 when the last DTLS record that went out was a
+                           handshake record (0 = application data)
+     remote_fingerprint_alg
+                           the algorithm of the fingerprint the peer
+                           announced
+
+   The "fingerprint mismatch" log line now prints the algorithm, the length
+   and the first 8 characters instead of the two full fingerprints: a
+   fingerprint is a public negotiated value, but there is no reason to put
+   the whole thing into a log file.
+
+2. src/peer_connection.h / src/peer_connection.c -- a snapshot API:
+
+     int peer_connection_get_diagnostics(PeerConnection* pc,
+                                         PeerConnectionDiagnostics* out);
+
+   It reports the DTLS state / role / handshake verdict / fingerprint
+   summaries / handshake timing, and the ICE consent counters, the candidate
+   pairs (local + remote address, type, state, conncheck count) and the
+   local candidates.
+
+   The fingerprints are reduced to algorithm + length + the first 8
+   characters INSIDE libpeer, so the full value never crosses the library
+   boundary.
+
+3. The offer is read a second time (diagnostics only): the a=setup: value
+   and the fingerprint the offer really carries.  The comparison in
+   peer_connection_set_remote_description() is left EXACTLY as it was --
+   this patch changes no behaviour of the handshake, it only makes the
+   outcome observable.
+
+★ No DTLS key material is logged or exported.  The printf block that dumped
+  the key material was deleted by 0022; nothing here touches it.
+diff --git a/src/dtls_srtp.h b/src/dtls_srtp.h
+index 2a5920f..edd0014 100644
+--- a/src/dtls_srtp.h
++++ b/src/dtls_srtp.h
+@@ -64,6 +64,37 @@ typedef struct DtlsSrtp {
+   DtlsSrtpState state;
+   int initialized;
+
++  // ---------------------------------------------------------------
++  // 0035 diagnostics: what the DTLS handshake actually returned.
++  //
++  // Until now the handshake result lived in a local variable of
++  // peer_connection_loop() and died with the stack frame, so the engine
++  // could never tell WHY the handshake did not finish.  These fields keep
++  // the verdict around long enough for the engine to report it.
++  //
++  // last_mbedtls_ret     the raw return code of the last
++  //                       mbedtls_ssl_handshake() step (MBEDTLS_ERR_SSL_* /
++  //                       MBEDTLS_ERR_X509_*; 0 means "the handshake is
++  //                       finished").
++  // fingerprint_check    0 = not checked yet, 1 = the peer's certificate
++  //                       matches the fingerprint from the offer, -1 =
++  //                       mismatch, -2 = the handshake finished without a
++  //                       peer certificate.
++  // handshake_active     1 while mbedtls_ssl_handshake() is running.
++  // last_write_is_handshake
++  //                       1 when the last DTLS record that went out was a
++  //                       handshake record (0 = application data).
++  // remote_fingerprint_alg
++  //                       the algorithm of the fingerprint the peer
++  //                       announced ("sha-256"); empty when the offer
++  //                       carried none.
++  // ---------------------------------------------------------------
++  int last_mbedtls_ret;
++  int fingerprint_check;
++  int handshake_active;
++  int last_write_is_handshake;
++  char remote_fingerprint_alg[16];
++
+   char local_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
+   char remote_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
+   char actual_remote_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
+diff --git a/src/dtls_srtp.c b/src/dtls_srtp.c
+index 43dccda..ab14b2b 100644
+--- a/src/dtls_srtp.c
++++ b/src/dtls_srtp.c
+@@ -163,6 +163,13 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
+   dtls_srtp->udp_send = dtls_srtp_udp_send;
+   dtls_srtp->udp_recv = dtls_srtp_udp_recv;
+
++  // 0035: the diagnostics start out "unknown", not "ok".
++  dtls_srtp->last_mbedtls_ret = 0;
++  dtls_srtp->fingerprint_check = 0;
++  dtls_srtp->handshake_active = 0;
++  dtls_srtp->last_write_is_handshake = 0;
++  dtls_srtp->remote_fingerprint_alg[0] = '\0';
++
+   mbedtls_ssl_config_init(&dtls_srtp->conf);
+   mbedtls_ssl_init(&dtls_srtp->ssl);
+
+@@ -352,6 +359,7 @@ static void dtls_srtp_key_derivation_cb(void* context,
+
+ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
+   static mbedtls_timing_delay_context timer;
++  int ret;
+
+   mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
+
+@@ -365,7 +373,15 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
+
+   // Do exactly one non-blocking handshake step. The peer connection loop calls
+   // us again after polling the UDP socket, preserving MbedTLS' DTLS state.
+-  return mbedtls_ssl_handshake(&dtls_srtp->ssl);
++  //
++  // 0035: remember the raw return code.  It is the only thing that says WHY
++  // the handshake stalled (WANT_READ = "the peer did not answer", a negative
++  // SSL code = "the peer said no").
++  dtls_srtp->handshake_active = 1;
++  ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
++  dtls_srtp->handshake_active = 0;
++  dtls_srtp->last_mbedtls_ret = ret;
++  return ret;
+ }
+
+ static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
+@@ -412,9 +428,45 @@ static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
+   return ret;
+ }
+
++// 0035: the fingerprint is a PUBLIC negotiated value (it is in the SDP), but
++// the log still should not carry the whole thing around: the algorithm, the
++// length and the first 8 characters are enough to tell two fingerprints
++// apart.  The length is bounded because remote_fingerprint is filled with
++// strncpy() and is NOT guaranteed to be NUL terminated.
++static int dtls_srtp_bounded_len(const char* str, int max_len) {
++  int len = 0;
++  if (!str) {
++    return 0;
++  }
++  while (len < max_len && str[len] != '\0') {
++    len++;
++  }
++  return len;
++}
++
++static void dtls_srtp_fingerprint_summary(const char* fingerprint, char* out, size_t out_len) {
++  int len;
++  int i;
++
++  if (!out || out_len == 0) {
++    return;
++  }
++  out[0] = '\0';
++  if (!fingerprint) {
++    return;
++  }
++  len = dtls_srtp_bounded_len(fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH);
++  for (i = 0; i < len && i < 8 && (size_t)(i + 1) < out_len; ++i) {
++    out[i] = fingerprint[i];
++  }
++  out[i] = '\0';
++}
++
+ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
+   int ret;
+   dtls_srtp->remote_addr = addr;
++  // 0035: every attempt starts with an unknown fingerprint verdict.
++  dtls_srtp->fingerprint_check = 0;
+
+   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+     ret = dtls_srtp_handshake_server(dtls_srtp);
+@@ -434,13 +486,27 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
+     dtls_srtp_x509_digest(remote_crt, dtls_srtp->actual_remote_fingerprint);
+
+     if (strncmp(dtls_srtp->remote_fingerprint, dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH) != 0) {
+-      LOGE("Actual and Expected Fingerprint mismatch: %s %s",
+-           dtls_srtp->remote_fingerprint,
+-           dtls_srtp->actual_remote_fingerprint);
++      char expected_prefix[16];
++      char actual_prefix[16];
++      dtls_srtp_fingerprint_summary(dtls_srtp->remote_fingerprint, expected_prefix, sizeof(expected_prefix));
++      dtls_srtp_fingerprint_summary(dtls_srtp->actual_remote_fingerprint, actual_prefix, sizeof(actual_prefix));
++      // 0035: remember the verdict -- this is the difference between "the
++      // handshake never started" and "the handshake ran and the peer was
++      // rejected".
++      dtls_srtp->fingerprint_check = -1;
++      LOGE("DTLS fingerprint mismatch: expected alg=%s len=%d prefix=%s, actual len=%d prefix=%s",
++           dtls_srtp->remote_fingerprint_alg[0] ? dtls_srtp->remote_fingerprint_alg : "?",
++           dtls_srtp_bounded_len(dtls_srtp->remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
++           expected_prefix,
++           dtls_srtp_bounded_len(dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH),
++           actual_prefix);
+       return -1;
+     }
++    dtls_srtp->fingerprint_check = 1;
+
+   } else {
++    // 0035: the handshake finished but the peer sent no certificate.
++    dtls_srtp->fingerprint_check = -2;
+     LOGE("no remote fingerprint");
+     return -1;
+   }
+diff --git a/src/peer_connection.h b/src/peer_connection.h
+index ccad642..34df677 100644
+--- a/src/peer_connection.h
++++ b/src/peer_connection.h
+@@ -266,6 +266,96 @@ int peer_connection_get_ice_candidate_pair_stats(PeerConnection* pc,
+                                                  int* inprogress,
+                                                  int* succeeded,
+                                                  int* failed);
++/**
++ * @brief How many candidate pairs / local candidates a diagnostics snapshot
++ *        carries.
++ *
++ * libpeer keeps up to AGENT_MAX_CANDIDATE_PAIRS (100) pairs.  The snapshot is
++ * capped so the structure stays small enough to fill on the stack of the
++ * engine's JS loop thread; the real counts are reported next to the arrays.
++ */
++#define PEER_DIAG_MAX_CANDIDATE_PAIRS 32
++#define PEER_DIAG_MAX_LOCAL_CANDIDATES 10
++
++/** One ICE candidate pair, flattened for a JSON dump. */
++typedef struct PeerCandidatePairDiag {
++  char local_ip[64];
++  uint16_t local_port;
++  char local_type[12];
++  char remote_ip[64];
++  uint16_t remote_port;
++  char remote_type[12];
++  char state[12];
++  int conncheck;
++  int selected;
++  int nominated;
++} PeerCandidatePairDiag;
++
++/** One local ICE candidate, flattened for a JSON dump. */
++typedef struct PeerLocalCandidateDiag {
++  char ip[64];
++  uint16_t port;
++  char type[12];
++  char proto[8];
++  char state[12];
++} PeerLocalCandidateDiag;
++
++/**
++ * @brief A snapshot of the DTLS and ICE internals (0035).
++ *
++ * WHY: until now the only thing the engine could report was "the last DTLS
++ * write returned N", which comes from dtls_srtp_write() -- that is the SCTP
++ * payload write, NOT the handshake.  The handshake's own verdict lived in a
++ * local variable of peer_connection_loop() and died with the stack frame, so
++ * a failed DTLS handshake was completely invisible.
++ *
++ * The fingerprints are only exposed as algorithm + length + the first 8
++ * characters: they are public negotiated values, but there is no reason to
++ * put the whole thing into a log file.
++ */
++typedef struct PeerConnectionDiagnostics {
++  /* --- DTLS --- */
++  int dtls_state;               /* DtlsSrtpState: 0 init / 1 handshake / 2 connected */
++  int dtls_role;                /* DtlsSrtpRole: 0 client / 1 server */
++  int dtls_handshake_ret;       /* return code of the last dtls_srtp_handshake() */
++  int dtls_handshake_ret_valid; /* 1 once the handshake ran at least once */
++  int dtls_mbedtls_ret;         /* raw mbedTLS code of the last handshake step */
++  int dtls_fingerprint_check;   /* 0 unknown / 1 match / -1 mismatch / -2 no peer cert */
++  int dtls_handshake_attempts;
++  uint32_t dtls_handshake_started_ms;
++  uint32_t dtls_handshake_elapsed_ms;
++  int dtls_last_write_result;
++  int dtls_last_write_is_handshake; /* 1 = the last DTLS record out was a handshake record */
++  char dtls_fingerprint_alg[16];    /* our own fingerprint (the one in our answer) */
++  int dtls_fingerprint_len;
++  char dtls_fingerprint_prefix[16];
++  char dtls_remote_fingerprint_alg[16]; /* the fingerprint libpeer compares against */
++  int dtls_remote_fingerprint_len;
++  char dtls_remote_fingerprint_prefix[16];
++  char dtls_offer_fingerprint_alg[16];  /* the fingerprint the offer actually carries */
++  int dtls_offer_fingerprint_len;
++  char dtls_offer_fingerprint_prefix[16];
++  char dtls_setup_attr[16];             /* the offer's a=setup: value */
++
++  /* --- ICE --- */
++  uint32_t ice_consent_requests_sent;
++  uint32_t ice_consent_attempts;
++  uint32_t ice_binding_responses_received;
++  uint32_t ice_rtt_ms;
++  int ice_local_candidate_count;
++  int ice_candidate_pair_count;
++  int ice_selected_pair_index;  /* index into ice_candidate_pairs, -1 when none */
++  int ice_nominated_pair_index; /* index into ice_candidate_pairs, -1 when none */
++  PeerCandidatePairDiag ice_candidate_pairs[PEER_DIAG_MAX_CANDIDATE_PAIRS];
++  PeerLocalCandidateDiag ice_local_candidates[PEER_DIAG_MAX_LOCAL_CANDIDATES];
++} PeerConnectionDiagnostics;
++
++/**
++ * @brief Fill `out` with a snapshot of the DTLS and ICE internals.
++ *
++ * Returns 0 on success, -1 when the arguments are unusable.
++ */
++int peer_connection_get_diagnostics(PeerConnection* pc, PeerConnectionDiagnostics* out);
+
+ int peer_connection_get_rtt_ms(PeerConnection* pc);
+
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index 3d0e7c6..115214c 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -78,6 +78,16 @@ struct PeerConnection {
+
+   int dtls_handshake_attempts;
+   uint32_t dtls_handshake_started_ms;
++  // 0035: the verdict of the last handshake attempt.  It used to be a local
++  // variable of peer_connection_loop() and was lost with the stack frame.
++  int dtls_last_handshake_ret;
++  int dtls_handshake_ret_valid;
++  // The offer's a=setup: value ("actpass" / "active" / "passive") and the
++  // fingerprint the offer really carries -- both for diagnostics only, the
++  // role and the comparison keep using the values below.
++  char dtls_setup_attr[16];
++  char dtls_offer_fingerprint_alg[16];
++  char dtls_offer_fingerprint[DTLS_SRTP_FINGERPRINT_LENGTH];
+   int sctp_create_attempted;
+   int completed_udp_packets;
+   int completed_rtcp_packets;
+@@ -336,6 +346,10 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t
+   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
+   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
+
++  // 0035: remember whether the record that goes out is a handshake record
++  // (ClientHello / Certificate / Finished ...) or application data.
++  dtls_srtp->last_write_is_handshake = dtls_srtp->handshake_active ? 1 : 0;
++
+   // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
+   return agent_send(&pc->agent, buf, len);
+ }
+@@ -725,6 +739,10 @@ int peer_connection_loop(PeerConnection* pc) {
+       pc->dtls_handshake_attempts++;
+
+       int dtls_ret = dtls_srtp_handshake(&pc->dtls_srtp, NULL);
++      // 0035: keep the verdict.  It used to die with this stack frame, which
++      // is why a failed DTLS handshake was completely invisible.
++      pc->dtls_last_handshake_ret = dtls_ret;
++      pc->dtls_handshake_ret_valid = 1;
+       if (dtls_ret == 0) {
+         LOGD("DTLS-SRTP handshake done");
+         peer_connection_diag_log("dtls_done attempts=%d datachannel=%d",
+@@ -945,6 +963,68 @@ int peer_connection_loop(PeerConnection* pc) {
+   return packet_processed;
+ }
+
++// 0035 (diagnostics only): parse an "a=fingerprint:<alg> <value>" line the way
++// it really reads.
++//
++// The comparison in peer_connection_set_remote_description() copies the value
++// from a FIXED offset (buf + 22), which assumes the algorithm name is exactly
++// "sha-256".  This helper does not change that behaviour -- it only produces
++// an independent, honest view of the line so that the engine can tell
++// "the offer says X" from "libpeer compares against Y".
++static void peer_connection_parse_fingerprint_line(const char* line,
++                                                   char* alg, size_t alg_len,
++                                                   char* value, size_t value_len,
++                                                   char* compare_alg,
++                                                   size_t compare_alg_len) {
++  const char* p;
++  size_t n = 0;
++
++  if (alg && alg_len > 0) {
++    alg[0] = '\0';
++  }
++  if (value && value_len > 0) {
++    value[0] = '\0';
++  }
++  if (compare_alg && compare_alg_len > 0) {
++    compare_alg[0] = '\0';
++  }
++  if (!line || !alg || alg_len == 0 || !value || value_len == 0) {
++    return;
++  }
++
++  p = strstr(line, "a=fingerprint:");
++  if (!p) {
++    return;
++  }
++  p += strlen("a=fingerprint:");
++
++  while (p[n] != '\0' && p[n] != ' ' && p[n] != '\r' && p[n] != '\n' &&
++         n + 1 < alg_len) {
++    alg[n] = p[n];
++    n++;
++  }
++  alg[n] = '\0';
++
++  while (p[n] == ' ') {
++    n++;
++  }
++
++  {
++    size_t v = 0;
++    while (p[n] != '\0' && p[n] != '\r' && p[n] != '\n' && v + 1 < value_len) {
++      value[v] = p[n];
++      v++;
++      n++;
++    }
++    value[v] = '\0';
++  }
++
++  if (compare_alg && compare_alg_len > 0) {
++    strncpy(compare_alg, alg, compare_alg_len - 1);
++    compare_alg[compare_alg_len - 1] = '\0';
++  }
++}
++
+ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType type) {
+   char* start = (char*)sdp;
+   char* line = NULL;
+@@ -957,6 +1037,13 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
+   int audio_ssrc_seen = 0;
+   Agent* agent = &pc->agent;
+
++  // 0035: a new description means a new fingerprint verdict.
++  pc->dtls_setup_attr[0] = '\0';
++  pc->dtls_offer_fingerprint_alg[0] = '\0';
++  pc->dtls_offer_fingerprint[0] = '\0';
++  pc->dtls_srtp.remote_fingerprint_alg[0] = '\0';
++  pc->dtls_srtp.fingerprint_check = 0;
++
+   while ((line = strstr(start, "\r\n"))) {
+     line = strstr(start, "\r\n");
+     size_t line_len = (size_t)(line - start);
+@@ -969,8 +1056,36 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
+       role = DTLS_SRTP_ROLE_CLIENT;
+     }
+
++    // 0035: remember what the offer actually said about the DTLS role.  The
++    // role libpeer picks (always CLIENT for an answer) is wrong when the
++    // offer says "a=setup:active" -- the peer then insists on being the
++    // client and the handshake cannot succeed.
++    if (strstr(buf, "a=setup:")) {
++      const char* setup_value = strstr(buf, "a=setup:") + strlen("a=setup:");
++      size_t setup_len = 0;
++      while (setup_value[setup_len] != '\0' &&
++             setup_value[setup_len] != '\r' &&
++             setup_value[setup_len] != '\n' &&
++             setup_len + 1 < sizeof(pc->dtls_setup_attr)) {
++        pc->dtls_setup_attr[setup_len] = setup_value[setup_len];
++        setup_len++;
++      }
++      pc->dtls_setup_attr[setup_len] = '\0';
++    }
++
+     if (strstr(buf, "a=fingerprint")) {
+       strncpy(pc->dtls_srtp.remote_fingerprint, buf + 22, DTLS_SRTP_FINGERPRINT_LENGTH);
++
++      // 0035 (diagnostics only -- the comparison above is left exactly as it
++      // was): parse the line the way it really reads, so the engine can show
++      // what the offer carries next to what libpeer compares against.
++      peer_connection_parse_fingerprint_line(buf,
++                                             pc->dtls_offer_fingerprint_alg,
++                                             sizeof(pc->dtls_offer_fingerprint_alg),
++                                             pc->dtls_offer_fingerprint,
++                                             sizeof(pc->dtls_offer_fingerprint),
++                                             pc->dtls_srtp.remote_fingerprint_alg,
++                                             sizeof(pc->dtls_srtp.remote_fingerprint_alg));
+     }
+
+     if (strstr(buf, "a=ice-ufrag") &&
+@@ -1331,3 +1446,164 @@ int peer_connection_get_video_rtp_stats(PeerConnection* pc, PeerVideoRtpStats* s
+   stats->nack_packets_requested = pc->video_nack_packets_requested;
+   return 0;
+ }
++
++// 0035: turn a fingerprint into "algorithm + length + first 8 characters".
++// The fingerprint is a public negotiated value, but there is no reason to put
++// the whole thing into a log file or a stats blob.
++static void peer_connection_fingerprint_summary(const char* fingerprint,
++                                                const char* alg,
++                                                char* out_alg, size_t out_alg_len,
++                                                int* out_len,
++                                                char* out_prefix, size_t out_prefix_len) {
++  int len = 0;
++  int i;
++
++  if (out_alg && out_alg_len > 0) {
++    out_alg[0] = '\0';
++  }
++  if (out_prefix && out_prefix_len > 0) {
++    out_prefix[0] = '\0';
++  }
++  if (out_len) {
++    *out_len = 0;
++  }
++  if (!fingerprint) {
++    return;
++  }
++  while (len < DTLS_SRTP_FINGERPRINT_LENGTH && fingerprint[len] != '\0') {
++    len++;
++  }
++  if (out_len) {
++    *out_len = len;
++  }
++  if (out_alg && out_alg_len > 0 && alg) {
++    strncpy(out_alg, alg, out_alg_len - 1);
++    out_alg[out_alg_len - 1] = '\0';
++  }
++  if (out_prefix && out_prefix_len > 0) {
++    for (i = 0; i < len && i < 8 && (size_t)(i + 1) < out_prefix_len; ++i) {
++      out_prefix[i] = fingerprint[i];
++    }
++    out_prefix[i] = '\0';
++  }
++}
++
++int peer_connection_get_diagnostics(PeerConnection* pc, PeerConnectionDiagnostics* out) {
++  int i;
++
++  if (!pc || !out) {
++    return -1;
++  }
++  memset(out, 0, sizeof(*out));
++
++  // --- DTLS ---------------------------------------------------------
++  out->dtls_state = (int)pc->dtls_srtp.state;
++  out->dtls_role = (int)pc->dtls_srtp.role;
++  out->dtls_handshake_ret = pc->dtls_handshake_ret_valid ? pc->dtls_last_handshake_ret : 0;
++  out->dtls_handshake_ret_valid = pc->dtls_handshake_ret_valid;
++  out->dtls_mbedtls_ret = pc->dtls_srtp.last_mbedtls_ret;
++  out->dtls_fingerprint_check = pc->dtls_srtp.fingerprint_check;
++  out->dtls_handshake_attempts = pc->dtls_handshake_attempts;
++  out->dtls_handshake_started_ms = pc->dtls_handshake_started_ms;
++  out->dtls_handshake_elapsed_ms =
++      pc->dtls_handshake_started_ms
++          ? (uint32_t)(ports_get_epoch_time() - pc->dtls_handshake_started_ms)
++          : 0;
++  out->dtls_last_write_result = dtls_srtp_get_last_write_result();
++  out->dtls_last_write_is_handshake = pc->dtls_srtp.last_write_is_handshake;
++
++  // our own fingerprint -- the one that goes into our answer
++  peer_connection_fingerprint_summary(pc->dtls_srtp.local_fingerprint,
++                                      "sha-256",
++                                      out->dtls_fingerprint_alg,
++                                      sizeof(out->dtls_fingerprint_alg),
++                                      &out->dtls_fingerprint_len,
++                                      out->dtls_fingerprint_prefix,
++                                      sizeof(out->dtls_fingerprint_prefix));
++
++  // the fingerprint libpeer compares the peer's certificate against
++  peer_connection_fingerprint_summary(pc->dtls_srtp.remote_fingerprint,
++                                      pc->dtls_srtp.remote_fingerprint_alg[0]
++                                          ? pc->dtls_srtp.remote_fingerprint_alg
++                                          : "?",
++                                      out->dtls_remote_fingerprint_alg,
++                                      sizeof(out->dtls_remote_fingerprint_alg),
++                                      &out->dtls_remote_fingerprint_len,
++                                      out->dtls_remote_fingerprint_prefix,
++                                      sizeof(out->dtls_remote_fingerprint_prefix));
++
++  // the fingerprint the offer really carries
++  peer_connection_fingerprint_summary(pc->dtls_offer_fingerprint,
++                                      pc->dtls_offer_fingerprint_alg[0]
++                                          ? pc->dtls_offer_fingerprint_alg
++                                          : "?",
++                                      out->dtls_offer_fingerprint_alg,
++                                      sizeof(out->dtls_offer_fingerprint_alg),
++                                      &out->dtls_offer_fingerprint_len,
++                                      out->dtls_offer_fingerprint_prefix,
++                                      sizeof(out->dtls_offer_fingerprint_prefix));
++
++  strncpy(out->dtls_setup_attr, pc->dtls_setup_attr, sizeof(out->dtls_setup_attr) - 1);
++  out->dtls_setup_attr[sizeof(out->dtls_setup_attr) - 1] = '\0';
++
++  // --- ICE ----------------------------------------------------------
++  out->ice_consent_requests_sent = pc->agent.consent_requests_sent;
++  out->ice_consent_attempts = pc->agent.consent_attempts;
++  out->ice_binding_responses_received = pc->agent.binding_responses_received;
++  out->ice_rtt_ms = pc->agent.smoothed_binding_rtt_ms;
++  out->ice_local_candidate_count = pc->agent.local_candidates_count;
++  out->ice_candidate_pair_count = pc->agent.candidate_pairs_num;
++  out->ice_selected_pair_index = -1;
++  out->ice_nominated_pair_index = -1;
++  for (i = 0; i < pc->agent.candidate_pairs_num && i < PEER_DIAG_MAX_CANDIDATE_PAIRS; ++i) {
++    IceCandidatePair* pair = &pc->agent.candidate_pairs[i];
++    PeerCandidatePairDiag* diag = &out->ice_candidate_pairs[i];
++
++    memset(diag, 0, sizeof(*diag));
++    strncpy(diag->state,
++            peer_connection_ice_state_name(pair->state),
++            sizeof(diag->state) - 1);
++    diag->conncheck = pair->conncheck;
++    diag->selected = (pair == pc->agent.selected_pair) ? 1 : 0;
++    diag->nominated = (pair == pc->agent.nominated_pair) ? 1 : 0;
++    if (diag->selected) {
++      out->ice_selected_pair_index = i;
++    }
++    if (diag->nominated) {
++      out->ice_nominated_pair_index = i;
++    }
++
++    if (pair->local) {
++      addr_to_string(&pair->local->addr, diag->local_ip, sizeof(diag->local_ip));
++      diag->local_port = pair->local->addr.port;
++      strncpy(diag->local_type,
++              peer_connection_ice_type_name(pair->local->type),
++              sizeof(diag->local_type) - 1);
++    }
++    if (pair->remote) {
++      addr_to_string(&pair->remote->addr, diag->remote_ip, sizeof(diag->remote_ip));
++      diag->remote_port = pair->remote->addr.port;
++      strncpy(diag->remote_type,
++              peer_connection_ice_type_name(pair->remote->type),
++              sizeof(diag->remote_type) - 1);
++    }
++  }
++
++  for (i = 0; i < pc->agent.local_candidates_count && i < PEER_DIAG_MAX_LOCAL_CANDIDATES; ++i) {
++    IceCandidate* candidate = &pc->agent.local_candidates[i];
++    PeerLocalCandidateDiag* diag = &out->ice_local_candidates[i];
++
++    memset(diag, 0,sizeof(*diag));
++    addr_to_string(&candidate->addr, diag->ip, sizeof(diag->ip));
++    diag->port = candidate->addr.port;
++    strncpy(diag->type,
++            peer_connection_ice_type_name(candidate->type),
++            sizeof(diag->type) - 1);
++    strncpy(diag->proto, candidate->transport, sizeof(diag->proto) - 1);
++    strncpy(diag->state,
++            peer_connection_ice_state_name(candidate->state),
++            sizeof(diag->state) - 1);
++  }
++
++  return 0;
++}

@@ -19,9 +19,13 @@ typedef struct {
 } nx_gamepad_button_t;
 
 // Web Gamepad index order -> Switch HidNpadButton masks (see AGENTS.md note).
+// The order is the standard Web Gamepad API ("standard" mapping) order:
+// A=0, B=1, X=2, Y=3, L=4, R=5, LT=6, RT=7, View=8, Menu=9,
+// L3=10, R3=11, D-Pad Up=12, Down=13, Left=14, Right=15.
+// (The Switch ZL/ZR triggers occupy the standard LT/RT slots.)
 const u64 standard_button_masks[] = {
-    HidNpadButton_B,     HidNpadButton_A,      HidNpadButton_Y,
-    HidNpadButton_X,     HidNpadButton_L,      HidNpadButton_R,
+    HidNpadButton_A,     HidNpadButton_B,      HidNpadButton_X,
+    HidNpadButton_Y,     HidNpadButton_L,      HidNpadButton_R,
     HidNpadButton_ZL,    HidNpadButton_ZR,     HidNpadButton_Minus,
     HidNpadButton_Plus,  HidNpadButton_StickL, HidNpadButton_StickR,
     HidNpadButton_Up,    HidNpadButton_Down,   HidNpadButton_Left,

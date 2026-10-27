@@ -119,6 +119,44 @@ typedef enum {
 	NX_RENDER_GPU,      // attempt GPU regardless of regime (falls back to raster)
 } nx_render_mode_t;
 
+// `[canvas] yuv_convert = gpu | cpu` — WHERE the planar-I420 -> RGB conversion
+// for video frames happens (canvas.cc's drawImage).
+//
+//   gpu (default) = Skia's GPU YUVA texture (SkImages::TextureFromYUVAPixmaps):
+//                   the YUV->RGB math runs in a GPU shader. This is the
+//                   historical behavior, byte-for-byte unchanged by this
+//                   switch. It uploads ~1.5 B/px instead of BGRA's 4 B/px,
+//                   but it depends on the GL backend being able to sample
+//                   YUV planes — UNVERIFIED on the Switch's Mesa/Nouveau
+//                   stack (docs/44 §7.1 lists it as the top open risk).
+//   cpu           = expand I420 -> BGRA on the CPU (the same integer
+//                   coefficients webgl.cc already uses for video textures)
+//                   and then take canvas.cc's existing BGRA branch. This is
+//                   the A/B arm of the "glitched video" investigation
+//                   (docs/46 §experiment 3, patches/0030-NOTES.md).
+typedef enum {
+	NX_CANVAS_YUV_CONVERT_GPU = 0, // default — unchanged behavior
+	NX_CANVAS_YUV_CONVERT_CPU = 1, // CPU I420 -> BGRA
+} nx_canvas_yuv_convert_t;
+
+// TLS ClientHello shape (`[tls] profile`).
+//
+//   default = mbedTLS' stock PRESET_DEFAULT.  It advertises EVERY enabled
+//             ciphersuite (dozens), sends NO ALPN extension, and (in
+//             mbedTLS 2.28) can only speak TLS 1.2 -- so the ClientHello is
+//             trivially identifiable as "a mbedTLS client", a well-known
+//             TLS-fingerprint signature.
+//   browser = a short, browser-like ciphersuite list + ALPN + a modern curve
+//             order.  This does NOT make the ClientHello byte-identical to
+//             Chrome's: mbedTLS hard-codes the extension SET/ORDER inside
+//             ssl_write_client_hello(), and 2.28 has no TLS 1.3 at all, so
+//             there is no supported_versions extension.  What it does is stop
+//             the fingerprint from looking like stock mbedTLS.
+typedef enum {
+	NX_TLS_PROFILE_DEFAULT = 0, // stock mbedTLS defaults (unchanged behavior)
+	NX_TLS_PROFILE_BROWSER,      // browser-like ClientHello (short list + ALPN)
+} nx_tls_profile_t;
+
 // Console / on-screen terminal styling overrides (`[console]` section). The
 // runtime does not consume these in C — they are exposed verbatim on
 // `$.config.console` and the JS console layer seeds the global console's
@@ -219,6 +257,16 @@ typedef struct {
 	// Phase 0 fbo-spike recipe survives as engine code before Phase 2.C grows
 	// the JS-visible WebGL bridge on top. Defaults false so shell renders
 	// normally with no bridge touched.
+	// [video] want_yuv — the decoded frame stays planar I420 (Y|U|V, 1.5 B/px)
+	// and the GPU does the YUV->RGB (Skia's YUVA path in canvas.cc), instead
+	// of letting swscale produce BGRA (4 B/px) on the CPU.
+	//
+	// ★ Default true. Setting it to false switches the whole chain to
+	//   swscale -> BGRA — that is the A/B we need to tell "the conversion is
+	//   broken" from "the GPU YUVA path is broken" (docs/46 §experiment 1).
+	//   The WebCodecs path (Switch.VideoDecoder) has the same switch in JS
+	//   already: `new VideoDecoder(url, { yuv: false })`.
+	bool want_yuv;
 	bool webgl_test_fbo;
 	// [webgl] state_probe: Phase 2.G.0 state-contract probe. When true, the
 	// bridge queries 4 candidate GL states (UBO indexed bindings, sampler-
@@ -247,6 +295,19 @@ typedef struct {
 	// is Citron/jitless-only. Inert until the switch-v8 monolith is rebuilt
 	// with `v8_enable_drumbrake=true`.
 	bool wasm_interpreter_opt_in;
+	// [tls] profile -- see nx_tls_profile_t above.  Defaults to
+	// NX_TLS_PROFILE_DEFAULT; opt in with `[tls] profile = browser` in
+	// nxjs.ini or sdmc:/switch/nxjs-override.ini (the latter is picked up
+	// at startup, so the profile can be flipped on the card without a
+	// rebuild).
+	nx_tls_profile_t tls_profile;
+	// [canvas] yuv_convert — where the planar-I420 -> RGB conversion for video
+	// frames happens. NX_CANVAS_YUV_CONVERT_GPU (default) keeps the existing
+	// Skia GPU YUVA path byte-for-byte; NX_CANVAS_YUV_CONVERT_CPU expands
+	// I420 -> BGRA on the CPU (webgl.cc's coefficients) and takes the existing
+	// BGRA branch. A/B switch for the "glitched video" investigation — see
+	// patches/0030-NOTES.md.
+	nx_canvas_yuv_convert_t canvas_yuv_convert;
 	nx_socket_config_t socket;
 	nx_threadpool_config_t threadpool; // [threadpool] libuv pool overrides
 	nx_console_config_t console; // [console] styling, exposed on $.config.console

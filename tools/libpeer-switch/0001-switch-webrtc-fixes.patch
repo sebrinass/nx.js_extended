@@ -1,0 +1,483 @@
+Switch specific fixes for libpeer (extern/libpeer).
+
+extern/libpeer is a git SUBMODULE (patch 0003 brings it in), so its sources
+must not be edited in place: the next `git submodule update` would throw the
+changes away.  This patch is therefore applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built.
+
+What it fixes (the Switch/xbox WebRTC port pit list):
+
+  1. ICE host candidate: the Switch has no getifaddrs(), so the address now
+     comes from the engine (nx_libpeer_get_local_ipv4() -> libnx
+     nifmGetCurrentIpAddress()).  The gethostid() fallback rejects
+     loopback and link local, because gethostid() answers INADDR_LOOPBACK
+     when its nifm query fails.
+  2. Inbound packet buffers: CONFIG_PACKET_BUFFER_SIZE (2048) replaces
+     CONFIG_MTU (1300) for the UDP receive buffer, the DTLS read buffer, the
+     SCTP packet buffer and the RTP reorder slot.  A 1300 byte receive
+     buffer truncated SRTP protected H.264 packets, so the authentication
+     tag no longer matched and the packets were dropped.
+  3. ICE tie-breaker: generated per session, never 0 (strict peers reject
+     that) and written in NETWORK byte order (RFC 8445 section 5) instead
+     of the raw host order u64.
+  4. libsrtp uses mbedTLS for its AES / HMAC, so the binary carries one
+     crypto stack instead of two.
+  5. The DTLS write result is normalised to the usrsctp output callback
+     contract (0 = sent, positive errno = failed) and the raw mbedTLS value
+     is kept for the self test.  The retry loop is bounded now, it used to
+     be able to spin forever.
+  6. / 7. usrsctp already runs with the full stack (SACK, retransmission,
+     congestion control, PR-SCTP) and the DataChannel policy already sets
+     SCTP_UNORDERED + SCTP_PR_SCTP_RTX, so nothing had to change there.
+
+Note: the blank context lines below are empty instead of a single space.
+git apply accepts both, and this way the patch file itself carries no
+trailing whitespace.
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ac7de5f..47a912f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -100,15 +100,30 @@ if(NOT INPUT_CONTENT MATCHES "OpenNOW Switch mbedtls overrides")
+   file(WRITE "${_OPENNOW_MBEDTLS_CONFIG}" "${MODIFIED_CONTENT}\n${_OPENNOW_MBEDTLS_MARKER}\n#define MBEDTLS_NO_PLATFORM_ENTROPY\n#define MBEDTLS_TEST_NULL_ENTROPY\n#undef MBEDTLS_TIMING_C\n#undef MBEDTLS_NET_C\n")
+ endif()
+
++# libsrtp uses mbedTLS for its AES / HMAC instead of its own built-in
++# implementation.  That keeps ONE crypto stack in the binary: the very same
++# mbedTLS 3.4.0 that runs the DTLS handshake also runs the SRTP encryption,
++# instead of shipping a second AES implementation next to it.
++#
++# The mbedTLS paths are passed explicitly because the cross build's
++# find_path() / find_library() only look inside the toolchain root and would
++# not find dist/.  libsrtp therefore has to be built AFTER mbedtls, otherwise
++# those paths do not exist yet -- add_dependencies() enforces that order.
+ ExternalProject_Add(srtp2
+   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libsrtp
+   CMAKE_ARGS
+     -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+     -DTEST_APPS=off
++    -DENABLE_MBEDTLS=ON
++    -DMBEDTLS_INCLUDE_DIRS=${CMAKE_BINARY_DIR}/dist/include
++    -DMBEDTLS_LIBRARY=${CMAKE_BINARY_DIR}/dist/lib/libmbedtls.a
++    -DMBEDX509_LIBRARY=${CMAKE_BINARY_DIR}/dist/lib/libmbedx509.a
++    -DMBEDCRYPTO_LIBRARY=${CMAKE_BINARY_DIR}/dist/lib/libmbedcrypto.a
+     -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/dist
+     -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
+ )
++add_dependencies(srtp2 mbedtls)
+
+ ExternalProject_Add(usrsctp
+   SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/usrsctp
+diff --git a/src/agent.c b/src/agent.c
+index 8b29ee3..a0fad16 100644
+--- a/src/agent.c
++++ b/src/agent.c
+@@ -33,6 +33,32 @@ void agent_clear_candidates(Agent* agent) {
+   agent->binding_responses_received = 0;
+ }
+
++// Generate the ICE tie-breaker for this session.
++//
++// RFC 8445 section 5 requires it to be a non-zero 64-bit value, and it has
++// to be stable for the lifetime of the session.  The old code used a fixed
++// 0, which strict peers (the Xbox family, for one) reject outright.
++//
++// The value is seeded from the wall clock plus the monotonic clock so two
++// sessions on the same boot do not end up with the same tie-breaker, and
++// then mixed through splitmix64 so the low bits are not simply the clock.
++static uint64_t agent_generate_tie_breaker(void) {
++  uint64_t seed = (uint64_t)ports_get_epoch_time() * 1000000u +
++                   (uint64_t)(ports_get_monotonic_time_us() % 1000000u);
++  uint64_t value = seed;
++  for (int i = 0; i < 4; i++) {
++    value += 0x9E3779B97F4A7C15ULL;
++    uint64_t z = value;
++    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
++    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
++    value = z ^ (z >> 31);
++  }
++  if (value == 0) {
++    value = 1;
++  }
++  return value;
++}
++
+ int agent_create(Agent* agent) {
+   int ret;
+   if ((ret = udp_socket_open(&agent->udp_sockets[0], AF_INET, 0)) < 0) {
+@@ -52,6 +78,7 @@ int agent_create(Agent* agent) {
+   agent_clear_candidates(agent);
+   memset(agent->remote_ufrag, 0, sizeof(agent->remote_ufrag));
+   memset(agent->remote_upwd, 0, sizeof(agent->remote_upwd));
++  agent->tie_breaker = agent_generate_tie_breaker();
+   return 0;
+ }
+
+@@ -332,7 +359,13 @@ static void agent_create_binding_response(Agent* agent, StunMessage* msg, Addres
+ }
+
+ static void agent_create_binding_request(Agent* agent, StunMessage* msg, int nominate, uint32_t sequence) {
+-  uint64_t tie_breaker = 0;  // always be controlled
++  // RFC 8445 section 5: the ICE-CONTROLLING / ICE-CONTROLLED attribute is a
++  // 64-bit value in NETWORK byte order.  The old code wrote the raw host
++  // order u64, which a little-endian host byte-swaps on the wire.
++  uint8_t tie_breaker[8];
++  for (int i = 0; i < 8; i++) {
++    tie_breaker[i] = (uint8_t)(agent->tie_breaker >> (56 - i * 8));
++  }
+   // send binding request
+   stun_msg_create(msg, STUN_CLASS_REQUEST | STUN_METHOD_BINDING);
+   if (sequence != 0)
+@@ -345,9 +378,9 @@ static void agent_create_binding_request(Agent* agent, StunMessage* msg, int nom
+   if (agent->mode == AGENT_MODE_CONTROLLING) {
+     if (nominate)
+       stun_msg_write_attr(msg, STUN_ATTR_TYPE_USE_CANDIDATE, 0, NULL);
+-    stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLING, 8, (char*)&tie_breaker);
++    stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLING, 8, (char*)tie_breaker);
+   } else {
+-    stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLED, 8, (char*)&tie_breaker);
++    stun_msg_write_attr(msg, STUN_ATTR_TYPE_ICE_CONTROLLED, 8, (char*)tie_breaker);
+   }
+   stun_msg_finish(msg, STUN_CREDENTIAL_SHORT_TERM, agent->remote_upwd, strlen(agent->remote_upwd));
+ }
+diff --git a/src/agent.h b/src/agent.h
+index a6618c5..470fe22 100644
+--- a/src/agent.h
++++ b/src/agent.h
+@@ -69,6 +69,14 @@ struct Agent {
+
+   AgentMode mode;
+
++  // RFC 8445 ICE tie-breaker.
++  //
++  // It must not be 0: strict ICE implementations (the Xbox family, for one)
++  // reject a session whose tie-breaker is zero.  It also has to stay the
++  // same for the whole session, so it is generated once per Agent instead of
++  // per Binding request.
++  uint64_t tie_breaker;
++
+   IceCandidatePair candidate_pairs[AGENT_MAX_CANDIDATE_PAIRS];
+   IceCandidatePair* selected_pair;
+   IceCandidatePair* nominated_pair;
+diff --git a/src/config.h b/src/config.h
+index 1daf171..d75816e 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -7,6 +7,21 @@
+ #define SCTP_MTU (1200)
+ #define CONFIG_MTU (1300)
+
++// Size of the INBOUND packet buffers.
++//
++// CONFIG_MTU is the OUTBOUND MTU: it is what we advertise and what our own
++// packets are sized to.  An inbound RTP packet is bigger than that, because
++// the sender's payload plus the 10-byte SRTP header plus the 10-byte
++// authentication tag have to fit in one datagram.  With a 1300-byte receive
++// buffer such a datagram is truncated, the SRTP authentication tag no longer
++// matches, and the packet is dropped as if it had been lost.
++//
++// 2048 is the value the Switch/xbox WebRTC ports use: it covers a 1500-byte
++// RTP payload plus SRTP overhead with room to spare.
++#ifndef CONFIG_PACKET_BUFFER_SIZE
++#define CONFIG_PACKET_BUFFER_SIZE (2048)
++#endif
++
+ #ifndef CONFIG_USE_LWIP
+ #define CONFIG_USE_LWIP 0
+ #endif
+diff --git a/src/dtls_srtp.c b/src/dtls_srtp.c
+index 9caf5dd..57f6022 100644
+--- a/src/dtls_srtp.c
++++ b/src/dtls_srtp.c
+@@ -15,6 +15,10 @@
+ #include "socket.h"
+ #include "utils.h"
+
++// How often dtls_srtp_write() retries a mbedTLS "would block" answer before
++// it gives up and reports the error.  The retry used to be unbounded.
++#define DTLS_SRTP_WRITE_MAX_RETRIES 8
++
+ int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
+   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
+   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
+@@ -486,13 +490,29 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
+   dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+ }
+
++// The raw mbedTLS return value of the last dtls_srtp_write() call.
++// See dtls_srtp_get_last_write_result() in dtls_srtp.h.
++static int g_dtls_srtp_last_write_result = 0;
++
++int dtls_srtp_get_last_write_result(void) {
++  return g_dtls_srtp_last_write_result;
++}
++
+ int dtls_srtp_write(DtlsSrtp* dtls_srtp, const unsigned char* buf, size_t len) {
+-  int ret;
++  int ret = 0;
++  int attempt;
+
+-  do {
++  // mbedTLS asks for a retry when the socket is not ready yet.  The retry
++  // used to be unbounded, which can spin forever inside the engine's loop
++  // thread and hang the whole page.  Cap it and hand the last error back.
++  for (attempt = 0; attempt < DTLS_SRTP_WRITE_MAX_RETRIES; attempt++) {
+     ret = mbedtls_ssl_write(&dtls_srtp->ssl, buf, len);
++    if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
++      break;
++    }
++  }
+
+-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
++  g_dtls_srtp_last_write_result = ret;
+   return ret;
+ }
+
+diff --git a/src/dtls_srtp.h b/src/dtls_srtp.h
+index 9f4b079..3f5ffaa 100644
+--- a/src/dtls_srtp.h
++++ b/src/dtls_srtp.h
+@@ -83,6 +83,17 @@ void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp);
+
+ int dtls_srtp_write(DtlsSrtp* dtls_srtp, const uint8_t* buf, size_t len);
+
++/**
++ * The raw return value of the last dtls_srtp_write() call.
++ *
++ * mbedTLS returns the number of bytes written on success and a NEGATIVE
++ * error code on failure.  usrsctp's output callback contract is the
++ * opposite: 0 means success and a POSITIVE errno means failure.  Keeping
++ * the raw value here makes the conversion a one-liner and lets the self
++ * test show what the transport really returned.
++ */
++int dtls_srtp_get_last_write_result(void);
++
+ int dtls_srtp_read(DtlsSrtp* dtls_srtp, uint8_t* buf, size_t len);
+
+ void dtls_srtp_sctp_to_dtls(DtlsSrtp* dtls_srtp, uint8_t* packet, int bytes);
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index 4add9eb..4cff55a 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -44,8 +44,12 @@ struct PeerConnection {
+   void (*ondatachannelopen)(void* userdata);
+   void (*ondatachannelclose)(void* userdata);
+
+-  uint8_t temp_buf[CONFIG_MTU];
+-  uint8_t agent_buf[CONFIG_MTU];
++  // temp_buf receives the decrypted DTLS stream (SCTP) and holds the local
++  // SDP while it is being assembled; agent_buf receives the raw UDP
++  // datagrams (STUN / DTLS / SRTP / SRTCP).  Both have to be able to hold a
++  // full inbound datagram, otherwise SRTP packets are truncated.
++  uint8_t temp_buf[CONFIG_PACKET_BUFFER_SIZE];
++  uint8_t agent_buf[CONFIG_PACKET_BUFFER_SIZE];
+   int agent_ret;
+   int dtls_pending;
+   int b_local_description_created;
+@@ -1248,6 +1252,18 @@ int peer_connection_get_rtt_ms(PeerConnection* pc) {
+   return ice_rtt_ms >= 0 ? ice_rtt_ms : sctp_get_rtt_ms(&pc->sctp);
+ }
+
++uint64_t peer_connection_get_ice_tie_breaker(PeerConnection* pc) {
++  if (!pc)
++    return 0;
++  return pc->agent.tie_breaker;
++}
++
++int peer_connection_get_last_dtls_write_result(PeerConnection* pc) {
++  if (!pc)
++    return 0;
++  return dtls_srtp_get_last_write_result();
++}
++
+ int peer_connection_get_video_rtp_stats(PeerConnection* pc, PeerVideoRtpStats* stats) {
+   if (pc == NULL || stats == NULL)
+     return -1;
+diff --git a/src/peer_connection.h b/src/peer_connection.h
+index 905eeb4..0b759f5 100644
+--- a/src/peer_connection.h
++++ b/src/peer_connection.h
+@@ -226,6 +226,23 @@ int peer_connection_get_ice_candidate_pair_stats(PeerConnection* pc,
+
+ int peer_connection_get_rtt_ms(PeerConnection* pc);
+
++/**
++ * @brief The ICE tie-breaker of this session.
++ *
++ * RFC 8445 requires it to be non-zero and stable for the whole session.
++ * The value is returned as a 64 bit integer; the caller has to print it in
++ * hexadecimal, a JSON number cannot carry 64 bits exactly.
++ */
++uint64_t peer_connection_get_ice_tie_breaker(PeerConnection* pc);
++
++/**
++ * @brief The raw mbedTLS return value of the last DTLS write.
++ *
++ * Positive = number of bytes written, negative = mbedTLS error code.
++ * See dtls_srtp_get_last_write_result().
++ */
++int peer_connection_get_last_dtls_write_result(PeerConnection* pc);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/ports.c b/src/ports.c
+index 799c657..6eaf968 100644
+--- a/src/ports.c
++++ b/src/ports.c
+@@ -25,6 +25,42 @@
+ #include "ports.h"
+ #include "utils.h"
+
++#if defined(__SWITCH__)
++// The Switch has no getifaddrs(): the compatibility stub returns an empty
++// list, so a host candidate could never be built and only the public STUN
++// candidate survived -> no direct LAN path.
++//
++// The engine owns the Switch specific networking, so it hands the local IPv4
++// address in through a weak hook (engine source/nx_webrtc_net.cc).  The hook
++// is weak so libpeer still links on its own; the gethostid() fallback below
++// is used when the engine is not linked in.
++#include <stdint.h>
++
++#if defined(__GNUC__)
++extern int nx_libpeer_get_local_ipv4(uint32_t* out) __attribute__((weak));
++#endif
++
++// The address is handed over as a network order "struct in_addr", i.e. the
++// four bytes in memory are the four address octets.  Test the octets and not
++// the integer value so the check does not depend on the host endianness.
++static int switch_ipv4_is_usable(uint32_t ip) {
++  uint8_t octets[4];
++  memcpy(octets, &ip, sizeof(octets));
++  if (octets[0] == 0) {
++    return 0;  // 0.0.0.0 - no address yet
++  }
++  if (octets[0] == 127) {
++    // 127.0.0.0/8 - gethostid() falls back to INADDR_LOOPBACK when its nifm
++    // query fails, and a loopback ICE candidate is worse than no candidate.
++    return 0;
++  }
++  if (octets[0] == 169 && octets[1] == 254) {
++    return 0;  // 169.254.0.0/16 - link local, not routable
++  }
++  return 1;
++}
++#endif
++
+ int ports_get_host_addr(Address* addr, const char* iface_prefix) {
+   int ret = 0;
+
+@@ -56,8 +92,19 @@ int ports_get_host_addr(Address* addr, const char* iface_prefix) {
+     }
+   }
+ #elif defined(__SWITCH__)
+-  uint32_t ip = gethostid();
+-  if (ip != 0 && addr->family == AF_INET) {
++  uint32_t ip = 0;
++  int have_ip = 0;
++#if defined(__GNUC__)
++  if (nx_libpeer_get_local_ipv4) {
++    have_ip = nx_libpeer_get_local_ipv4(&ip) ? 1 : 0;
++  }
++#endif
++  if (!have_ip) {
++    // Fallback for a libpeer that is not linked against the engine.
++    ip = (uint32_t)gethostid();
++    have_ip = 1;
++  }
++  if (have_ip && addr->family == AF_INET && switch_ipv4_is_usable(ip)) {
+       memcpy(&addr->sin.sin_addr, &ip, 4);
+       ret = 1;
+   }
+diff --git a/src/rtp.h b/src/rtp.h
+index d093956..62693f3 100644
+--- a/src/rtp.h
++++ b/src/rtp.h
+@@ -86,7 +86,10 @@ typedef void (*RtpOnVideoPacket)(const PeerVideoPacket* packet, void* user_data)
+ #define RTP_REORDER_WINDOW 128
+ #define RTP_REORDER_MAX_HOLD_PACKETS 64
+ #define RTP_REORDER_MAX_HOLD_MS 30
+-#define RTP_REORDER_PACKET_CAPACITY (CONFIG_MTU + 256)
++// One reorder slot has to hold a whole decrypted inbound packet, so it uses
++// the same size as the receive buffer.  With the old CONFIG_MTU-based size a
++// full-size packet was rejected by rtp_decoder_store_reordered() and lost.
++#define RTP_REORDER_PACKET_CAPACITY (CONFIG_PACKET_BUFFER_SIZE)
+
+ struct RtpDecoder {
+   RtpPayloadType type;
+diff --git a/src/sctp.c b/src/sctp.c
+index 4bd438a..b9fdee9 100644
+--- a/src/sctp.c
++++ b/src/sctp.c
+@@ -27,6 +27,25 @@ static atomic_int sctp_diagnostics_enabled;
+ typedef void (*SctpDiagnosticCallback)(const char*);
+ static _Atomic(SctpDiagnosticCallback) sctp_diagnostic_callback;
+
++// Convert an mbedTLS write result into the errno style contract that
++// usrsctp's conn_output callback uses: 0 means "sent", a POSITIVE errno
++// means "failed".
++//
++// mbedTLS returns the number of bytes written on success and a negative error
++// code on failure.  Handing the byte count straight back makes usrsctp treat
++// every emitted packet as a send error even though DTLS delivered it to the
++// network, and handing back a negative value violates the contract too.
++static int sctp_dtls_write_errno(int write_result) {
++  if (write_result >= 0) {
++    return 0;
++  }
++  if (write_result == MBEDTLS_ERR_SSL_WANT_WRITE ||
++      write_result == MBEDTLS_ERR_SSL_WANT_READ) {
++    return EAGAIN;
++  }
++  return EIO;
++}
++
+ void sctp_set_diagnostic_callback(void (*callback)(const char*)) {
+   atomic_store(&sctp_diagnostic_callback, callback);
+ }
+@@ -213,9 +232,12 @@ static int sctp_outgoing_data_cb(void* userdata, void* buf, size_t len, uint8_t
+   }
+
+   const int written = dtls_srtp_write(sctp->dtls_srtp, buf, len);
+-  if (written < 0)
+-    sctp_diag_log("dtls_write_failed ret=%d bytes=%zu", written, len);
+-  return written == (int)len ? 0 : -1;
++  if (written != (int)len) {
++    const int err = sctp_dtls_write_errno(written);
++    sctp_diag_log("dtls_write_failed ret=%d errno=%d bytes=%zu", written, err, len);
++    return err;
++  }
++  return 0;
+ #endif
+ }
+
+@@ -824,8 +846,10 @@ static void sctp_drain(Sctp* sctp) {
+     transport->output_count--;
+     pthread_mutex_unlock(&sctp_runtime_mutex);
+     const int written = dtls_srtp_write(sctp->dtls_srtp, packet.data, packet.len);
+-    if (written != (int)packet.len)
+-      sctp_diag_log("dtls_write_failed ret=%d bytes=%zu", written, packet.len);
++    if (written != (int)packet.len) {
++      const int err = sctp_dtls_write_errno(written);
++      sctp_diag_log("dtls_write_failed ret=%d errno=%d bytes=%zu", written, err, packet.len);
++    }
+   }
+ }
+ #endif
+diff --git a/src/sctp.h b/src/sctp.h
+index da3afe1..597c3ac 100644
+--- a/src/sctp.h
++++ b/src/sctp.h
+@@ -183,7 +183,10 @@ typedef struct Sctp {
+   void (*onclose)(void* userdata);
+
+   void* userdata;
+-  uint8_t buf[CONFIG_MTU];
++  // The DTLS read buffer is CONFIG_PACKET_BUFFER_SIZE bytes, so the SCTP
++  // packet buffer has to be at least that big: sctp_incoming_data() copies a
++  // decrypted datagram into it and a smaller buffer overflows.
++  uint8_t buf[CONFIG_PACKET_BUFFER_SIZE];
+ } Sctp;
+
+ int sctp_create_association(Sctp* sctp, DtlsSrtp* dtls_srtp);

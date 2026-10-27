@@ -205,6 +205,56 @@ static int ini_cb(void *user, const char *section, const char *name,
 		return 1;
 	}
 
+	if (str_ieq(section, "tls")) {
+		if (str_ieq(name, "profile")) {
+			if (str_ieq(value, "default"))
+				cfg->tls_profile = NX_TLS_PROFILE_DEFAULT;
+			else if (str_ieq(value, "browser"))
+				cfg->tls_profile = NX_TLS_PROFILE_BROWSER;
+			else
+				cfg_log("tls.profile=\"%s\" not honored: invalid "
+				        "(use default|browser), using default",
+				        value);
+		}
+	}
+
+	if (str_ieq(section, "video")) {
+		if (str_ieq(name, "want_yuv")) {
+			if (str_ieq(value, "true") || str_ieq(value, "yes") ||
+			    str_ieq(value, "1"))
+				cfg->want_yuv = true;
+			else if (str_ieq(value, "false") || str_ieq(value, "no") ||
+			         str_ieq(value, "0"))
+				cfg->want_yuv = false;
+			else
+				cfg_log("video.want_yuv=\"%s\" not honored: invalid "
+				        "(use true|false), using true",
+				        value);
+		}
+	}
+
+	if (str_ieq(section, "canvas")) {
+		if (str_ieq(name, "yuv_convert")) {
+			// Where the planar-I420 -> RGB conversion for video frames
+			// happens (canvas.cc's drawImage). "gpu" = Skia's GPU YUVA
+			// texture (the historical behavior); "cpu" = expand I420 ->
+			// BGRA on the CPU and take the existing BGRA branch. See
+			// patches/0030-NOTES.md (A/B switch for the glitched-video
+			// investigation).
+			if (str_ieq(value, "gpu"))
+				cfg->canvas_yuv_convert = NX_CANVAS_YUV_CONVERT_GPU;
+			else if (str_ieq(value, "cpu"))
+				cfg->canvas_yuv_convert = NX_CANVAS_YUV_CONVERT_CPU;
+			else
+				cfg_log("canvas.yuv_convert=\"%s\" not honored: invalid "
+				        "(use gpu|cpu), using gpu",
+				        value);
+		} else {
+			cfg_log("canvas.%s ignored: unknown key", name);
+		}
+		return 1;
+	}
+
 	if (str_ieq(section, "renderer")) {
 		if (str_ieq(name, "mode")) {
 			if (str_ieq(value, "auto"))
@@ -415,7 +465,10 @@ void nx_config_defaults(nx_config_t *cfg) {
 	cfg->webgl_state_probe = false;
 	cfg->webgl_state_probe_active = false;
 	cfg->wasm_interpreter_opt_in = false;
+	cfg->tls_profile = NX_TLS_PROFILE_DEFAULT;
 	cfg->loaded = false;
+	cfg->canvas_yuv_convert = NX_CANVAS_YUV_CONVERT_GPU;
+	cfg->want_yuv = true;
 }
 
 bool nx_config_load(nx_config_t *cfg, const char *ini_path) {

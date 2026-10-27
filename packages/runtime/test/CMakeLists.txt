@@ -48,6 +48,13 @@ set(TEST_SOURCES
   # Host audio output sink (wall-clock paced consumer thread); the device
   # equivalent is source/audio-sink-audren.cc.
   src/audio-sink.cc
+  # Host fake for the WebRTC backend. The device backend
+  # (source/webrtc_backend_libpeer.cc) needs libpeer plus a devkitPro
+  # cross-compiled mbedtls with MBEDTLS_SSL_DTLS_SRTP, libsrtp and usrsctp --
+  # none of which exist on the host. This file implements the same C ABI
+  # (source/webrtc_backend.h) with a deterministic fake, so the portable V8
+  # half (source/webrtc.cc) is still compiled and exercised here.
+  src/webrtc-backend-stub.cc
 )
 
 # Real nx.js source modules that are portable (compiled from source/*.cc, with
@@ -76,6 +83,9 @@ set(NX_SOURCES
   ${NX_SOURCE_DIR}/url.cc
   ${NX_SOURCE_DIR}/util.cc
   ${NX_SOURCE_DIR}/video.cc
+  # WebRTC binding (portable half). The libpeer backend is NOT in this list:
+  # it is device-only. See src/webrtc-backend-stub.cc.
+  ${NX_SOURCE_DIR}/webrtc.cc
   ${NX_SOURCE_DIR}/window.cc
   ${NX_SOURCE_DIR}/wrap.cc
 )

@@ -433,6 +433,20 @@ export function setMediaPlaybackState(state: boolean) {
 }
 
 /**
+ * Combined keep-awake switch.
+ *
+ * `true` declares media playback (the system will not dim the screen or
+ * auto-sleep) and additionally disables auto sleep directly. Returns the
+ * libnx `Result` code of the first failing call (0 on success).
+ *
+ * The engine restores both flags to `false` on every teardown path, so this
+ * never outlives the process.
+ */
+export function setKeepAwake(state: boolean): number {
+	return $.appletSetKeepAwake(state);
+}
+
+/**
  * Returns memory usage statistics from the [V8](https://v8.dev/) JavaScript
  * engine via V8's `HeapStatistics`.
  *

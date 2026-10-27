@@ -47,6 +47,15 @@ std::unordered_map<std::string, std::string> g_prefetch_sources;
 // Modules loaded outside a page context (e.g. the runtime entrypoint via
 // nx_run_entry_module) are absent from this map.
 std::unordered_map<std::string, std::string> g_module_page_base;
+// Resolved-URL -> the exact source text that nx_module_run compiled for that
+// URL (patch 0034). The prefetch registry (g_prefetch_sources) cannot serve
+// this purpose: the page runner stores the *rewritten* body there (it patches
+// three.js sources on the way in) while it hands the *original* body to
+// moduleRun() -- comparing against g_prefetch_sources would report a false
+// mismatch. Keeping the run-source separately lets the idempotency check in
+// nx_module_run tell "the very same module, handed over twice" apart from a
+// genuine duplicate registration ("same URL, different body").
+std::unordered_map<std::string, std::string> g_module_run_sources;
 
 void register_module(Isolate *iso, Local<Module> module,
                      const std::string &url) {
@@ -453,7 +462,9 @@ MaybeLocal<Promise> dynamic_import_callback(
 //      itself (brewser://, http(s)://) and for source it has already read.
 //   3. Runtime calls moduleRun(source, url, pageBase) with the inline module's
 //      body (or fetched src). The returned Promise resolves when top-level
-//      await settles.
+//      await settles. Calling it again for the SAME url with the SAME body in
+//      the SAME page scope is idempotent (the already-evaluated module is
+//      handed back instead of an error) -- see nx_module_run.
 //   4. On page navigation, runtime calls moduleClearPage(pageBase) to purge
 //      the page's importmap, module cache entries, and prefetched sources.
 // ---------------------------------------------------------------------------
@@ -572,6 +583,7 @@ void nx_module_run(const FunctionCallbackInfo<Value> &info) {
 	String::Utf8Value src(iso, info[0]);
 	String::Utf8Value url(iso, info[1]);
 	String::Utf8Value base(iso, info[2]);
+	std::string src_s = utf8_to_string(src);
 	std::string url_s = utf8_to_string(url);
 	std::string base_s = utf8_to_string(base);
 	if (url_s.empty() || base_s.empty()) {
@@ -583,12 +595,61 @@ void nx_module_run(const FunctionCallbackInfo<Value> &info) {
 		return;
 	}
 
-	// If this URL has already been compiled, `resolve_module_callback` would
-	// return the cached instance; re-executing would either replay the module
-	// (silently discarding new source) or throw a redeclaration error. Neither
-	// is what the caller expects. Fail loudly so runtime code assigns unique
-	// URLs per inline / re-run.
-	if (g_module_cache.find(url_s) != g_module_cache.end()) {
+	// ---------------------------------------------------------------
+	// Idempotency (patch 0034).
+	//
+	// The page runner can hand the SAME module URL to moduleRun() more
+	// than once inside one page session: the live DOM is re-populated and
+	// the page scripts are re-run. A browser behaves exactly the same way
+	// -- a second `<script type="module" src="same.js">` resolves to the
+	// already-instantiated module and does NOT evaluate it a second time
+	// (the module map is keyed by URL).
+	//
+	// The old code rejected EVERY second call with "moduleRun: url already
+	// registered". On the official cloud page that dropped the main bundle
+	// (web.4f0790db.js) on the second pass, so the page stayed on its
+	// static "loading" placeholder.
+	//
+	// Criterion for "the very same module, handed over twice" -- ALL of
+	// these must hold:
+	//   1. the URL is already in g_module_cache (it was compiled here), and
+	//   2. the cached module's status is Module::kEvaluated, i.e. its
+	//      evaluation finished SUCCESSFULLY (kErrored = the first run
+	//      failed, kEvaluating = still pending behind a top-level await:
+	//      neither counts as "successfully executed"), and
+	//   3. the page scope matches -- g_module_page_base[url] == pageBase.
+	//      A different page base is a different page session, so the same
+	//      URL showing up again is a genuine duplicate registration, and
+	//   4. the source text is byte-identical to the body that was compiled
+	//      (g_module_run_sources[url]). A different body -- or a different
+	//      module kind -- is a genuine duplicate registration too.
+	//
+	// Anything that fails the criterion keeps the original loud
+	// "moduleRun: url already registered" rejection, so a real duplicate
+	// registration is never swallowed.
+	// ---------------------------------------------------------------
+	auto cached_it = g_module_cache.find(url_s);
+	if (cached_it != g_module_cache.end()) {
+		Local<Module> cached = cached_it->second.Get(iso);
+		bool evaluated_ok = cached->GetStatus() == Module::kEvaluated;
+		auto base_it = g_module_page_base.find(url_s);
+		bool same_scope =
+		    base_it != g_module_page_base.end() && base_it->second == base_s;
+		auto src_it = g_module_run_sources.find(url_s);
+		bool same_source =
+		    src_it != g_module_run_sources.end() && src_it->second == src_s;
+		if (evaluated_ok && same_scope && same_source) {
+			// Already registered AND successfully executed for this page:
+			// skip the re-execution (a V8 module can only be evaluated once
+			// anyway) and hand back the namespace of the live instance.
+			fprintf(stderr,
+			        "[module] moduleRun: skip duplicate (already evaluated) "
+			        "url=%s\n",
+			        url_s.c_str());
+			fflush(stderr);
+			resolver->Resolve(context, cached->GetModuleNamespace()).Check();
+			return;
+		}
 		resolver
 		    ->Reject(context,
 		             Exception::Error(nx_str(
@@ -610,6 +671,10 @@ void nx_module_run(const FunctionCallbackInfo<Value> &info) {
 	}
 	register_module(iso, module, url_s);
 	g_module_page_base[url_s] = base_s;
+	// Remember the body that was compiled for this URL, so a later
+	// moduleRun() for the same URL can be told apart from a genuine
+	// duplicate registration (see the idempotency check above).
+	g_module_run_sources[url_s] = src_s;
 
 	if (module->InstantiateModule(context, resolve_module_callback)
 	        .IsNothing()) {
@@ -690,6 +755,7 @@ void nx_module_clear_page(const FunctionCallbackInfo<Value> &info) {
 			g_module_cache.erase(cache_it);
 		}
 		g_prefetch_sources.erase(url);
+		g_module_run_sources.erase(url);
 		it = g_module_page_base.erase(it);
 	}
 }
@@ -938,4 +1004,5 @@ void nx_modules_teardown() {
 	g_importmaps.clear();
 	g_prefetch_sources.clear();
 	g_module_page_base.clear();
+	g_module_run_sources.clear();
 }

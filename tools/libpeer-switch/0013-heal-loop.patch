@@ -1,0 +1,273 @@
+The heal loop for libpeer (extern/libpeer): observable counters for
+every link of the "ask for a key frame -> key frame arrives -> picture
+is whole again" chain, across all three repair channels.
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place.  This patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it
+is the thirteenth patch of that series; it stacks on top of
+0012-audio-observation).
+
+Why
+---
+
+A lost packet breaks the H.264 reference chain and the picture smears.
+Three channels can repair it, and until now none of them had a CLOSED
+loop -- we could see that we asked, never whether the ask was answered:
+
+  * RTCP PLI (engine side, the 0011/B2 contract): pli_sent was counted,
+    but "the key frame arrived because we asked" was indistinguishable
+    from "it arrived anyway";
+  * NACK (engine side): nack_requests / nack_packets_requested were
+    counted, but a retransmission that landed was not (reordered_packets
+    is the approximate landing counter -- an out-of-order packet that
+    filled its slot);
+  * 20032 (app side): out of libpeer's scope; correlate its send times
+    against idrDelivered growth in this patch's line.
+
+One more gap the device data could not close: keyframes_received (0011)
+counts key frames at NAL assembly, so a key frame that arrives inside a
+DAMAGED access unit still counts -- correct for "the cloud sent one",
+useless for "the picture got better".  Nothing counted key frames that
+actually SURVIVED into a delivered access unit.
+
+What
+---
+
+  * rtp.c / rtp.h: au_had_idr (per-access-unit transient flag, set in
+    the same branches where 0011 counts keyframes_received, cleared by
+    rtp_decoder_reset_access_unit) and keyframes_delivered (incremented
+    in rtp_decoder_flush_access_unit's success branch).  The gap between
+    keyframes_received and keyframes_delivered is OUR loss, not the
+    cloud's.
+
+  * peer_connection.c: peer_connection_account_heal_keyframe() runs
+    every loop tick.  A key frame that arrives while a PLI is "open"
+    (sent at most PEER_HEAL_ANSWER_WINDOW_MS = 3000 ms ago) counts as
+    answered -- attribution is by time window, which is the strongest
+    attribution an RTCP PLI allows (it carries no packet identity).
+    heal_healed_ms records when a DELIVERED key frame last landed.
+
+  * One diagnostic line every 2 s (prefix heal_state -- needs an engine
+    whitelist key, see the delivery note):
+
+      heal_state pliSent=.. pliAnswered=.. idrSeen=.. idrDelivered=..
+                 nackReq=.. nackPkts=.. recovered=.. auOk=.. auDrop=..
+                 healedAgoMs=..
+
+How the criterion changes (AGENTS.md 6.2, rule 8)
+---------------------------------------------------
+
+  * the cloud does not answer RTCP PLI: pliSent grows, pliAnswered
+    stays 0 (and given the official browser session seems to use no
+    RTCP at all, this channel may be structurally dead -- then 20032 is
+    the only live request path);
+  * the cloud answers but we lose the frame: idrSeen grows,
+    idrDelivered does not -- OUR reassembler dropped it;
+  * the frame survives but the picture still smears: idrDelivered grows
+    while auDrop keeps growing -- the damage is ahead of the repair;
+  * healthy: healedAgoMs stays small, auOk grows.
+
+Every one of them moves, so the line is a criterion and not a
+decoration.
+
+A host-side self test of the rule itself is next to this file:
+tools/libpeer-switch/0013-heal-loop-check.mjs
+
+Note for the Switch build
+-------------------------
+
+struct RtpDecoder lives in the installed src/rtp.h and gains two fields
+at its END (after audio_opus_packets) -- same rule as 0011/0012: libpeer
+must be rebuilt and the installed headers refreshed together with the
+engine, otherwise the two sides disagree about the struct layout.
+
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index a644be7..4b99cb2 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -330,6 +330,20 @@ struct PeerConnection {
+   uint32_t rtp_unmatched_packets;
+   uint32_t rtp_learned_audio_ssrc;
+   uint32_t rtp_class_last_log_ms;
++  // 0013: the heal loop bookkeeping (peer_connection_account_heal_keyframe
++  // is the writer, peer_connection_log_heal_state the reader).
++  //   heal_seen_keyframes  keyframes_received as of the last poll;
++  //   heal_pli_answered    key frames that landed inside the answer
++  //                        window of a PLI;
++  //   heal_seen_delivered  keyframes_delivered as of the last poll;
++  //   heal_healed_ms       wall clock of the last key frame that
++  //                        survived into a delivered access unit;
++  //   heal_diag_ms         the 2 s line timer.
++  uint32_t heal_seen_keyframes;
++  uint32_t heal_pli_answered;
++  uint32_t heal_seen_delivered;
++  uint32_t heal_healed_ms;
++  uint32_t heal_diag_ms;
+ };
+ 
+ static int peer_connection_send_rtcp_nack(PeerConnection* pc, uint32_t ssrc,
+@@ -562,6 +576,84 @@ static void peer_connection_log_rtp_class(PeerConnection* pc) {
+                            pc->artp_decoder.audio_opus_packets);
+ }
+ 
++// 0013: how long after a PLI a key frame may land and still count as
++// "the PLI was answered".  Attribution is by time window -- an RTCP PLI
++// carries no packet identity, so this is the strongest attribution the
++// protocol allows.  3 s covers the B2 stale window plus one interval.
++#define PEER_HEAL_ANSWER_WINDOW_MS 3000
++
++// 0013: how often the heal loop line is written.
++#define PEER_HEAL_DIAG_INTERVAL_MS 2000
++
++// 0013 (task C): one step of the heal accounting, called every loop
++// tick.  Kept flat with plain locals ON PURPOSE: the self test extracts
++// these exact statements and executes them.
++//   A key frame that arrives while a PLI is "open" (sent at most
++//   PEER_HEAL_ANSWER_WINDOW_MS ago) counts as answered.
++static void peer_connection_account_heal_keyframe(PeerConnection* pc, uint32_t now_ms) {
++  const uint32_t kf_now = pc->vrtp_decoder.keyframes_received;
++  const uint32_t kf_prev = pc->heal_seen_keyframes;
++  const uint32_t pli_ms = pc->vrtp_decoder.pli_last_sent_ms;
++  const int fresh_pli = pli_ms != 0 && now_ms - pli_ms <= PEER_HEAL_ANSWER_WINDOW_MS;
++  if (kf_now != kf_prev) {
++    if (fresh_pli) {
++      pc->heal_pli_answered++;
++    }
++    pc->heal_seen_keyframes = kf_now;
++  }
++  const uint32_t kfd_now = pc->vrtp_decoder.keyframes_delivered;
++  const uint32_t kfd_prev = pc->heal_seen_delivered;
++  if (kfd_now != kfd_prev) {
++    pc->heal_healed_ms = now_ms;
++    pc->heal_seen_delivered = kfd_now;
++  }
++}
++
++// 0013 (task C): the heal loop line.  The three channels that can repair
++// a corrupted picture, one line, every 2 s:
++//   pli    engine-side RTCP PLI (the B2 contract): pliSent total,
++//          pliAnswered = key frames that landed inside the answer
++//          window of a PLI.  pliSent growing with pliAnswered stuck at
++//          0 is the "the cloud does not answer RTCP PLI" verdict
++//          (the official browser session may never use RTCP at all --
++//          then this channel is structurally dead and 20032 is the
++//          only live request path);
++//   idr    idrSeen counted at NAL assembly vs idrDelivered survived
++//          into a completed access unit; the gap is OUR loss, not the
++//          cloud's;
++//   nack   nackReq / nackPkts = what we asked to retransmit;
++//          recovered = out-of-order packets that filled their slot
++//          (the retransmission landing, approximately);
++//   au     auOk / auDrop = whether production resumed after the key
++//          frame ("the picture is whole again": healedAgoMs small).
++// The 20032 signaling channel is app-side; correlate its send times
++// against idrDelivered growth in the same log.
++static void peer_connection_log_heal_state(PeerConnection* pc) {
++  if (!pc) {
++    return;
++  }
++  const uint32_t now_ms = ports_get_epoch_time();
++  if (pc->heal_diag_ms != 0 &&
++      (uint32_t)(now_ms - pc->heal_diag_ms) < PEER_HEAL_DIAG_INTERVAL_MS) {
++    return;
++  }
++  pc->heal_diag_ms = now_ms;
++  const uint32_t healed_ago = pc->heal_healed_ms
++                                  ? (uint32_t)(now_ms - pc->heal_healed_ms)
++                                  : 0;
++  peer_connection_diag_log("heal_state pliSent=%u pliAnswered=%u idrSeen=%u idrDelivered=%u nackReq=%u nackPkts=%u recovered=%u auOk=%u auDrop=%u healedAgoMs=%u",
++                           pc->vrtp_decoder.pli_sent,
++                           pc->heal_pli_answered,
++                           pc->vrtp_decoder.keyframes_received,
++                           pc->vrtp_decoder.keyframes_delivered,
++                           pc->video_nack_requests,
++                           pc->video_nack_packets_requested,
++                           pc->vrtp_decoder.reordered_packets,
++                           pc->vrtp_decoder.access_units_completed,
++                           pc->vrtp_decoder.access_units_dropped,
++                           healed_ago);
++}
++
+ static void peer_connection_maybe_send_video_nacks(PeerConnection* pc,
+                                                    uint16_t newest_sequence) {
+   RtpDecoder* decoder = &pc->vrtp_decoder;
+@@ -1757,6 +1849,9 @@ int peer_connection_loop(PeerConnection* pc) {
+       peer_connection_log_pli_state(pc);
+       // 0012: the audio observation line (see peer_connection_log_rtp_class()).
+       peer_connection_log_rtp_class(pc);
++      // 0013: the heal loop accounting + line (task C).
++      peer_connection_account_heal_keyframe(pc, ports_get_epoch_time());
++      peer_connection_log_heal_state(pc);
+ 
+       break;
+     case PEER_CONNECTION_FAILED:
+diff --git a/src/rtp.c b/src/rtp.c
+index 4071fe3..a680850 100644
+--- a/src/rtp.c
++++ b/src/rtp.c
+@@ -321,6 +321,9 @@ static void rtp_decoder_reset_access_unit(RtpDecoder* rtp_decoder) {
+   rtp_decoder->au_has_sps = 0;
+   rtp_decoder->au_has_pps = 0;
+   rtp_decoder->au_damaged = 0;
++  // 0013: the "this access unit contains a key frame" fact does not
++  // survive the reset -- by design, one flag per access unit.
++  rtp_decoder->au_had_idr = 0;
+ }
+ 
+ static int rtp_decoder_append_access_unit_bytes(RtpDecoder* rtp_decoder, const uint8_t* data, size_t size) {
+@@ -360,6 +363,10 @@ static int rtp_decoder_append_access_unit_nalu(RtpDecoder* rtp_decoder, const ui
+     //   still a key frame the cloud sent us.
+     rtp_decoder->keyframes_received++;
+     rtp_decoder->last_keyframe_ms = ports_get_epoch_time();
++    // 0013: ... and remember that THIS access unit carries one, so the
++    // flush can tell "a key frame survived into a delivered picture"
++    // apart from "the cloud sent one, the reassembler threw it away".
++    rtp_decoder->au_had_idr = 1;
+     if (!rtp_decoder->au_has_sps && rtp_decoder->cached_sps_size > 0) {
+       if (rtp_decoder_append_access_unit_bytes(rtp_decoder, nalu_start_4bytecode, sizeof(nalu_start_4bytecode)) != 0 ||
+           rtp_decoder_append_access_unit_bytes(rtp_decoder, rtp_decoder->cached_sps, rtp_decoder->cached_sps_size) != 0)
+@@ -401,6 +408,13 @@ static void rtp_decoder_flush_access_unit(RtpDecoder* rtp_decoder) {
+     } else if (rtp_decoder->on_packet != NULL)
+       rtp_decoder->on_packet(rtp_decoder->au_buf, rtp_decoder->au_offset, rtp_decoder->user_data);
+     rtp_decoder->access_units_completed++;
++    // 0013: a key frame that made it INTO a delivered access unit -- the
++    // "the picture is whole again" moment of the heal loop.  The gap
++    // between keyframes_received and keyframes_delivered is ours (the
++    // reassembler dropped it), not the cloud's.
++    if (rtp_decoder->au_had_idr) {
++      rtp_decoder->keyframes_delivered++;
++    }
+   } else if (rtp_decoder->au_damaged) {
+     rtp_decoder->access_units_dropped++;
+   }
+@@ -729,6 +743,9 @@ static int rtp_decoder_append_h265_nalu_parts(RtpDecoder* rtp_decoder, const uin
+     //   where the NAL unit is assembled -- see the note in struct RtpDecoder.
+     rtp_decoder->keyframes_received++;
+     rtp_decoder->last_keyframe_ms = ports_get_epoch_time();
++    // 0013: same as the H.264 side -- this access unit carries a key
++    // frame; the flush decides whether it survives.
++    rtp_decoder->au_had_idr = 1;
+     if (!rtp_decoder->au_has_vps && rtp_decoder->cached_vps_size > 0) {
+       if (rtp_decoder_append_access_unit_bytes(rtp_decoder, nalu_start_4bytecode, sizeof(nalu_start_4bytecode)) != 0 ||
+           rtp_decoder_append_access_unit_bytes(rtp_decoder, rtp_decoder->cached_vps, rtp_decoder->cached_vps_size) != 0)
+diff --git a/src/rtp.h b/src/rtp.h
+index 87569b4..73f0578 100644
+--- a/src/rtp.h
++++ b/src/rtp.h
+@@ -215,6 +215,15 @@ struct RtpDecoder {
+   uint32_t audio_fail_shape;
+   uint32_t audio_red_packets;
+   uint32_t audio_opus_packets;
++  // 0013: the heal loop.  keyframes_received counts key frames the
++  // depacketizer SAW (at NAL assembly -- a key frame inside a damaged
++  // access unit still counts there); keyframes_delivered counts the
++  // ones that survived into a COMPLETE access unit handed to the video
++  // callback.  The difference is "the cloud sent it, we threw it away".
++  // au_had_idr is the transient per-access-unit flag that carries the
++  // fact from the NAL assembly to the flush.
++  uint32_t keyframes_delivered;
++  int au_had_idr;
+ };
+ 
+ struct RtpEncoder {

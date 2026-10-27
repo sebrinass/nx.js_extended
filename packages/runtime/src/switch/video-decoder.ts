@@ -98,11 +98,35 @@ export interface VideoFrameData {
  * ```
  */
 export class VideoDecoder {
-	/** Intrinsic frame width as reported by the codec, in pixels. */
+	/**
+	 * True once the open has finished (with a media or with an error).
+	 *
+	 * For a LOCAL source the open is synchronous, so this is already true
+	 * when the constructor returns and `width` / `height` / `duration` /
+	 * `fps` are valid right away. For a network source (http/https) the
+	 * open runs on a worker thread and those getters read 0 until the
+	 * open lands -- watch `ready` before reading them.
+	 */
+	declare readonly ready: boolean;
+	/**
+	 * Intrinsic frame width as reported by the codec, in pixels.
+	 *
+	 * 0 while a network open is still in flight. For a source with no
+	 * container (a raw H.264 feed) this is the size parsed out of the
+	 * first key frame's SPS.
+	 */
 	declare readonly width: number;
-	/** Intrinsic frame height as reported by the codec, in pixels. */
+	/**
+	 * Intrinsic frame height as reported by the codec, in pixels.
+	 *
+	 * @see {@link width}
+	 */
 	declare readonly height: number;
-	/** Container duration in seconds (0 if unknown). */
+	/**
+	 * Container duration in seconds, or `NaN` when the source has no known
+	 * duration (a streamed feed carries no total length -- that is
+	 * "unknown", not "zero seconds").
+	 */
 	declare readonly duration: number;
 	/** Content frame rate from the stream's avg_frame_rate (0 while opening /
 	 * unknown). The brewser shell reads this to pick the present cadence:

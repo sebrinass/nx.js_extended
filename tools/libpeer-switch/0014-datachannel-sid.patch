@@ -1,0 +1,237 @@
+0014-datachannel-sid: report the DataChannel's REAL sid when the channel opens
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place.  This patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it is
+the fourteenth patch of that series; it stacks on top of 0013-heal-loop).
+
+Why
+---
+
+The DataChannel never opened on the device, and the reason was visible in
+libpeer's own code -- not in the engine:
+
+  * the engine's `on_dc_open()` callback is wired to libpeer's
+    `ondatachannelopen`, which in turn is wired to `sctp_onopen()`;
+  * `sctp->onopen` fires when the SCTP **ASSOCIATION** comes up --
+    sctp.c: SCTP_COOKIE_ECHO (internal impl), SCTP_COOKIE_ACK (internal
+    impl), SCTP_COMM_UP (usrsctp impl);
+  * the **channel** does not exist at that moment.  The peer's DCEP OPEN is
+    parsed later, in `sctp_parse_data_channel_open()`, and THAT is where
+    the sid and the label are born (`sctp_record_open()` fills the stream
+    table).
+
+So the association-up callback cannot carry a sid: there is none yet.  The
+engine worked around that by reporting the sentinel -1, and the facade
+then keyed its fallback channel by -1 -- which is why "the DataChannel
+never opened" (open=false, sid=-1, zero DC messages received) and why a
+send with sid=-1 became `uint16_t` 65535, a stream the cloud does not
+have.
+
+What
+---
+
+  * sctp.h / sctp.c: a new callback
+    `void (*ondatachannel)(uint16_t sid, const char* label, void* userdata)`
+    plus `sctp_ondatachannel()` to register it.  It is invoked from
+    `sctp_parse_data_channel_open()` -- i.e. exactly when the peer's DCEP
+    OPEN has been recorded and the sid+label exist.  The association-up
+    callback is left untouched (no timing change for existing users).
+
+  * peer_connection.c / peer_connection.h: the same callback one level up,
+    `peer_connection_ondatachannelopened()`, wired in
+    `peer_connection_ondatachannel()` next to `sctp_onopen()`.
+
+  * peer_connection.c: `peer_connection_get_datachannel_sid()` -- the sid of
+    the channel the peer opened, WITHOUT depending on the channel's label
+    (`peer_connection_lookup_sid()` needs the exact label string; the cloud
+    uses "webrtc_data_channel" but that is an observation, not a contract).
+
+  * peer_connection.c: `peer_connection_get_sctp_rtt_ms()` -- the smoothed
+    RTT of the SCTP transport itself.  `peer_connection_get_rtt_ms()`
+    prefers the ICE candidate pair and only falls back to SCTP, so the
+    DataChannel path had no RTT of its own.
+
+Criterion (the value really moves)
+---
+
+  * before: the engine's datachannelopen event carries sid = -1, always.
+  * after:  the engine's datachannel event carries the real sid and the
+    real label of the channel the cloud opened, and the datachannelopen
+    event that follows carries the real sid.
+  * on the device the report must show a sid != -1 and a label of
+    "webrtc_data_channel" (the label the official session shows in
+    pc/analysis/data/official-session-20261024/datachannel-frames.json).
+
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index b5116fb..6877c80 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -251,6 +251,10 @@ struct PeerConnection {
+   void (*ondatachannelopen)(void* userdata);
+   void (*ondatachannelclose)(void* userdata);
+ 
++  /* 0014: fires when the peer's DCEP OPEN arrived -- the only moment at
++   *   which the sid and the label of that channel exist. */
++  void (*ondatachannelopened)(uint16_t sid, const char* label, void* userdata);
++
+   // temp_buf receives the decrypted DTLS stream (SCTP) and holds the local
+   // SDP while it is being assembled; agent_buf receives the raw UDP
+   // datagrams (STUN / DTLS / SRTP / SRTCP).  Both have to be able to hold a
+@@ -456,6 +460,16 @@ static void peer_connection_datachannel_open(void* userdata) {
+     pc->ondatachannelopen(pc->config.user_data);
+ }
+ 
++/* 0014: the peer's DataChannel opened -- the sid and the label are known
++ *   here and nowhere earlier: the association-up callback
++ *   (peer_connection_datachannel_open) fires before the peer's DCEP OPEN
++ *   and therefore has no sid to hand out. */
++static void peer_connection_datachannel_opened(uint16_t sid, const char* label, void* userdata) {
++  PeerConnection* pc = userdata;
++  if (pc->ondatachannelopened)
++    pc->ondatachannelopened(sid, label, pc->config.user_data);
++}
++
+ static void peer_connection_datachannel_close(void* userdata) {
+   PeerConnection* pc = userdata;
+   if (pc->ondatachannelclose)
+@@ -2365,9 +2379,37 @@ void peer_connection_ondatachannel(PeerConnection* pc,
+     sctp_onopen(&pc->sctp, peer_connection_datachannel_open);
+     sctp_onclose(&pc->sctp, peer_connection_datachannel_close);
+     sctp_onmessage(&pc->sctp, peer_connection_datachannel_message);
++    /* 0014: the channel-open callback (sid + label) is wired here, so it
++     *   fires exactly once per DCEP OPEN of the peer. */
++    sctp_ondatachannel(&pc->sctp, peer_connection_datachannel_opened);
+   }
+ }
+ 
++void peer_connection_ondatachannelopened(PeerConnection* pc,
++                                          void (*onopen)(uint16_t sid, const char* label, void* userdata)) {
++  if (pc)
++    pc->ondatachannelopened = onopen;
++}
++
++int peer_connection_get_datachannel_sid(PeerConnection* pc, uint16_t* sid) {
++  if (!pc || !sid)
++    return -1;
++  /* 0014: the first entry of the stream table is the channel the peer
++   *   opened (the cloud SDK uses a single DataChannel).  The sid exists
++   *   only after the peer's DCEP OPEN arrived -- before that the table is
++   *   empty and this returns -1. */
++  if (pc->sctp.stream_count <= 0)
++    return -1;
++  *sid = pc->sctp.stream_table[0].sid;
++  return 0;
++}
++
++int peer_connection_get_sctp_rtt_ms(PeerConnection* pc) {
++  if (!pc)
++    return -1;
++  return sctp_get_rtt_ms(&pc->sctp);
++}
++
+ int peer_connection_lookup_sid(PeerConnection* pc, const char* label, uint16_t* sid) {
+   for (int i = 0; i < pc->sctp.stream_count; i++) {
+     if (strncmp(pc->sctp.stream_table[i].label, label, sizeof(pc->sctp.stream_table[i].label)) == 0) {
+diff --git a/src/peer_connection.h b/src/peer_connection.h
+index 07ec4e0..147a3ee 100644
+--- a/src/peer_connection.h
++++ b/src/peer_connection.h
+@@ -289,6 +289,35 @@ void peer_connection_ondatachannel(PeerConnection* pc,
+                                    void (*onopen)(void* userdata),
+                                    void (*onclose)(void* userdata));
+ 
++/**
++ * @brief register the callback that fires when the peer's DataChannel opens.
++ *
++ * 0014: the onopen callback of peer_connection_ondatachannel() fires when
++ * the SCTP ASSOCIATION comes up -- that is BEFORE the peer's DCEP OPEN, so
++ * it cannot carry a sid.  This callback fires when the channel itself
++ * opens and carries the sid and the label of that channel.
++ */
++void peer_connection_ondatachannelopened(PeerConnection* pc,
++                                          void (*onopen)(uint16_t sid, const char* label, void* userdata));
++
++/**
++ * @brief the sid of the DataChannel the peer opened (0014).
++ *
++ * The sid exists only after the peer's DCEP OPEN arrived; before that this
++ * returns -1.  Unlike peer_connection_lookup_sid() this does not depend on
++ * the channel's label.
++ */
++int peer_connection_get_datachannel_sid(PeerConnection* pc, uint16_t* sid);
++
++/**
++ * @brief the smoothed RTT of the SCTP transport itself (0014).
++ *
++ * peer_connection_get_rtt_ms() prefers the ICE candidate pair and only
++ * falls back to SCTP; this one is always the SCTP transport's own srtt,
++ * i.e. the RTT of the DataChannel path.
++ */
++int peer_connection_get_sctp_rtt_ms(PeerConnection* pc);
++
+ int peer_connection_lookup_sid(PeerConnection* pc, const char* label, uint16_t* sid);
+ 
+ char* peer_connection_lookup_sid_label(PeerConnection* pc, uint16_t sid);
+diff --git a/src/sctp.c b/src/sctp.c
+index 2295ab7..09d3076 100644
+--- a/src/sctp.c
++++ b/src/sctp.c
+@@ -421,6 +421,12 @@ void sctp_parse_data_channel_open(Sctp* sctp, uint16_t sid, char* data, size_t l
+   sctp_diag_log("dcep_open sid=%u label=%s", sid, stream->label);
+   char ack = DATA_CHANNEL_ACK;
+   stream->ack_pending = sctp_outgoing_data(sctp, &ack, 1, PPID_CONTROL, sid) < 0;
++  /* 0014: the channel is open NOW -- the stream table above was filled by
++   *   sctp_record_open(), so the sid and the label both exist.  Tell the
++   *   owner: the association-up callback (sctp->onopen) fired long before
++   *   this point and had no sid to report. */
++  if (sctp->ondatachannel)
++    sctp->ondatachannel(sid, stream->label, sctp->userdata);
+ }
+ 
+ void sctp_handle_sctp_packet(Sctp* sctp, char* buf, size_t len) {
+@@ -1269,6 +1275,10 @@ void sctp_onopen(Sctp* sctp, void (*onopen)(void* userdata)) {
+   sctp->onopen = onopen;
+ }
+ 
++void sctp_ondatachannel(Sctp* sctp, void (*ondatachannel)(uint16_t sid, const char* label, void* userdata)) {
++  sctp->ondatachannel = ondatachannel;
++}
++
+ void sctp_onclose(Sctp* sctp, void (*onclose)(void* userdata)) {
+   sctp->onclose = onclose;
+ }
+diff --git a/src/sctp.h b/src/sctp.h
+index 44fba69..467f2c0 100644
+--- a/src/sctp.h
++++ b/src/sctp.h
+@@ -213,6 +213,12 @@ typedef struct Sctp {
+   void (*onopen)(void* userdata);
+   void (*onclose)(void* userdata);
+ 
++  /* 0014: the peer's DataChannel really opened (its DCEP OPEN arrived).
++   *   onopen fires when the SCTP ASSOCIATION comes up, which is BEFORE the
++   *   peer's DCEP OPEN -- so onopen cannot carry a sid.  This one fires
++   *   when the channel itself opens and carries that channel's sid+label. */
++  void (*ondatachannel)(uint16_t sid, const char* label, void* userdata);
++
+   void* userdata;
+   // The DTLS read buffer is CONFIG_PACKET_BUFFER_SIZE bytes, so the SCTP
+   // packet buffer has to be at least that big: sctp_incoming_data() copies a
+@@ -263,6 +269,16 @@ void sctp_onmessage(Sctp* sctp, void (*onmessage)(char* msg, size_t len, void* u
+ 
+ void sctp_onopen(Sctp* sctp, void (*onopen)(void* userdata));
+ 
++/**
++ * @brief register the callback that fires when the peer's DCEP OPEN arrives.
++ *
++ * 0014: this is the ONLY moment at which the sid and the label of the
++ * remote DataChannel exist -- sctp_record_open() fills the stream table
++ * with them.  The association-up callback (sctp_onopen) fires earlier and
++ * therefore cannot carry a sid.
++ */
++void sctp_ondatachannel(Sctp* sctp, void (*ondatachannel)(uint16_t sid, const char* label, void* userdata));
++
+ void sctp_onclose(Sctp* sctp, void (*onclose)(void* userdata));
+ 
+ #endif  // SCTP_H_

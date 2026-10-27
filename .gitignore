@@ -28,3 +28,7 @@ node_modules
 /.vscode/cache.db*
 test/runtime/build/
 test/runtime/dist/
+
+# facade 的构建产物（本仓库 facade/ 的 tsc 产物）——
+# 由 scripts/windows/build-engine.ps1 拷进来，见 patches/0009-facade-injection.patch
+/packages/runtime/facade-dist

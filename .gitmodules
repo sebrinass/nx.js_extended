@@ -1,0 +1,18 @@
+# extern/libpeer -- the native WebRTC backend (libpeer plus its third-party
+# dependencies: mbedtls / libsrtp / usrsctp / cJSON).  Cross-compiled for the
+# Switch by tools/build-libpeer.sh.
+#
+# The upstream that actually works on the Switch is OpenNOW-Switch's
+# extern/libpeer (github.com/OpenCloudGaming/OpenNOW-Switch @
+# e148ccda999e58dae4d2067a2e53b723c1bb7bec), which carries 3000+ lines of
+# Switch-specific changes on top of sepfy/libpeer.
+#
+# The URL below points at the fork that has to be created from that tree
+# (fork sepfy/libpeer and land the OpenNOW-Switch delta on top).  Until it
+# exists, "git submodule update --init" fails with "repository not found";
+# tools/build-libpeer.sh then falls back to $LIBPEER_SRC, a local copy of the
+# very same tree.
+[submodule "extern/libpeer"]
+	path = extern/libpeer
+	url = https://github.com/sebrinass/libpeer-switch.git
+	branch = main

@@ -132,7 +132,7 @@ export class Navigator {
 	 *
 	 * ```typescript
 	 * if (navigator.getGamepads()[0].buttons[0].pressed) {
-	 *   console.log('Button B is pressed on the first controller');
+	 *   console.log('Button A is pressed on the first controller');
 	 * }
 	 * ```
 	 *

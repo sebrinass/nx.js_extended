@@ -1,0 +1,50 @@
+REMB: cap the declared bandwidth at 1.2 Mbit/s while diagnosing the picture.
+
+Why (2026-10-26 real-device evidence):
+
+  report switch-report-20261026-052255.txt
+    RTCP REMB: sent 100 times, last declaration 8000000 bps
+    declared 8 Mbit/s vs measured 845318 bps  =>  9.5x
+
+  report switch-report-20261026-055400.txt
+    video RTP: packets=7452 gaps=11 forcedSkips=1718 AU(ok/drop)=903/9
+    => the 11 gap events span 1718 sequence numbers, i.e. ~156 packets each.
+       The loss is BURSTY, not scattered.  A link being overrun by a sender
+       told it may use 8 Mbit/s looks exactly like this.
+
+Two earlier hypotheses are settled; do not re-litigate them:
+
+  * The decoder is fine: hwDecode=true / srcPixFmt=nvtegra / outFormat=BGRA /
+    hwFrames=837 / swFrames=0 / convertUs=3.6 ms.  NVDEC never falls back.
+  * The reorder hold is NOT the bottleneck: raising RTP_REORDER_MAX_HOLD_MS
+    from 30 ms to 150 ms left frame-assembly efficiency unchanged
+    (AU(ok)/packets 12.8% -> 12.1%) while the skip accounting got worse.
+    That experiment was reverted; this patch is the only new variable.
+
+The cap goes to 1.2 Mbit/s on purpose: only a small margin above the
+~0.85 Mbit/s the console actually absorbed, and deliberately conservative.
+This round separates "the link is being overrun" from "something else is
+wrong".  If the picture becomes complete (even if blurry and low-fps) the
+bandwidth hypothesis is confirmed and the cap can be raised step by step.
+PEER_REMB_START_BPS stays at 2 Mbit/s; the AIMD clamps to [FLOOR, CEIL], so
+the session starts at the cap and multiplicative decrease can still walk it
+down to 1 Mbit/s.
+
+Patch 0015 of the libpeer-switch series, applied after 0014-datachannel-sid.patch.
+
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -143,6 +143,12 @@
+ // taken, and a recent-measured ring buffer for the median is not added
+ // at all.
+-#define PEER_REMB_CEIL_BPS 8000000u    /* never declare above 8 Mbit/s */
++// 2026-10-26: cap at 1.2 Mbit/s.  Real-device measurements show the console
++// only ever absorbs ~0.85 Mbit/s (845318 bps over 293.8 s) while this
++// constant let the AIMD climb to 8 Mbit/s -- 9.5x the sustainable rate.  The
++// cloud then encoded far above what the link carried and whole bursts of RTP
++// were lost (11 gap events x ~156 packets).  Deliberately conservative: this
++// round separates "bandwidth" from "everything else".  Raise it afterwards.
++#define PEER_REMB_CEIL_BPS 1200000u    /* never declare above 1.2 Mbit/s */
+ #define PEER_REMB_AI_STEP_BPS 500000u  /* +0.5 Mbit/s per quiet second */
+ #define PEER_REMB_MD_NUM 7u            /* on net stress: declared * 7/10 */
+ #define PEER_REMB_MD_DEN 10u

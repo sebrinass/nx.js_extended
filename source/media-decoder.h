@@ -29,6 +29,46 @@ typedef struct nx_media nx_media_t;
 // Channel cap for whole-file audio decoding (Web Audio allows 32).
 #define NX_MEDIA_MAX_CHANNELS 32
 
+// Pixel format of a presented video frame.
+//
+// The hardware decoder (Tegra X1 NVDEC) and the software decoder feed the
+// ring the SAME layout: planar I420 (Y|U|V contiguous) when the media was
+// opened with want_yuv, premultiplied BGRA otherwise.  The NVDEC surface is
+// NV12 (interleaved chroma) internally; the decoder de-interleaves it on
+// the decode thread, so the consumer never sees NV12.
+//
+// NX_MEDIA_PIXFMT_NV12 is reserved for a future interleaved-chroma path.
+typedef enum {
+	NX_MEDIA_PIXFMT_BGRA = 0, // premultiplied BGRA, 4 bytes per pixel
+	NX_MEDIA_PIXFMT_I420 = 1, // planar I420 (Y|U|V contiguous), 1.5 bytes/px
+	NX_MEDIA_PIXFMT_NV12 = 2, // NV12 4:2:0, luma + interleaved chroma planes
+} nx_media_pixfmt_t;
+
+// A presented video frame.
+//
+// `data` points at the BGRA pixels (BGRA) or the luma plane (I420);
+// `uv` is the U plane for I420; `v` is the V plane for I420.  Both are
+// NULL for BGRA frames.
+//
+// `colorspace` carries the same neutral tag nx_media_yuv_colorspace()
+// reports: 0 = Rec709 limited, 1 = Rec601 limited, 2 = JPEG/full range,
+// 3 = Rec709 full.  It is 0 for BGRA frames.
+//
+// The pointers stay valid until the next present call on the same media,
+// unless the caller passed a buffer to nx_media_present_frame() -- then the
+// frame is owned by the caller and stays valid until it is presented again.
+typedef struct nx_media_frame {
+	nx_media_pixfmt_t format;
+	const uint8_t *data; // BGRA pixels, or the luma plane
+	const uint8_t *uv;   // I420: U plane.  NV12: interleaved U,V chroma plane.
+	const uint8_t *v;    // I420 only: V plane (NULL for BGRA / NV12)
+	int pitch;           // BGRA: width*4.  I420/NV12: bytes per luma row.
+	int uv_pitch;        // I420/NV12: bytes per chroma row.
+	int width;
+	int height;
+	int colorspace;
+} nx_media_frame_t;
+
 // Decode an entire audio resource (any ffmpeg-supported container/codec)
 // from memory into planar f32 channel buffers. Backs `decodeAudioData()` and
 // the `Audio` element.
@@ -109,13 +149,25 @@ struct nx_media_net_t {
 // because teardown joins the open thread: without this, closing a decoder
 // aimed at a dead host freezes the calling thread for the whole timeout.
 // Must outlive the returned media.
+// `want_hw_decode` (Tegra X1 NVDEC): when true the video decoder is asked to
+// use the Switch's NVDEC hardware decoder.  The ring then holds the same
+// planar I420 (Y|U|V) frames as the software path when `want_yuv` is set, or
+// BGRA frames otherwise -- the hardware path never changes the contract the
+// caller sees.  It is a no-op unless the build defines NX_ENABLE_NVTEGRA
+// (the Switch build does, the host build does not).  The decoder falls back
+// to software on its own -- if the device cannot be created, if libavcodec
+// refuses the hwaccel for this codec, or if avcodec_open2() fails with the
+// hardware pixel format.  Use nx_media_present_frame() to read the frames
+// back: it reports the actual format; nx_media_present() cannot represent
+// the I420 frames and refuses to run on a media opened with want_yuv.
 nx_media_t *nx_media_open(const char *path, const uint8_t *mem,
                           size_t mem_size, std::shared_ptr<void> keepalive,
                           char *errbuf, size_t errbuf_size,
                           bool want_yuv = false,
                           const nx_media_net_t *net = nullptr,
                           int *av_err = nullptr,
-                          std::atomic<bool> *abort_flag = nullptr);
+                          std::atomic<bool> *abort_flag = nullptr,
+                          bool want_hw_decode = false);
 
 // Map an AVERROR from nx_media_open's `av_err` to a short stable token for
 // JS: "forbidden", "not-found", "unauthorized", "server-error", "timeout",
@@ -127,6 +179,12 @@ const char *nx_media_fail_kind(int av_err);
 int nx_media_width(nx_media_t *m);
 int nx_media_height(nx_media_t *m);
 double nx_media_duration(nx_media_t *m); // seconds (0 if unknown)
+// True when the container carried a duration, i.e. nx_media_duration() is a
+// real length. FALSE for a source with no container duration -- a streamed
+// H.264 feed has no moov and therefore no total length -- and the JS layer
+// must report NaN there instead of 0 (HTML: "If the media resource has no
+// known duration, the duration attribute must return NaN").
+bool nx_media_duration_known(nx_media_t *m);
 double nx_media_content_fps(nx_media_t *m); // stream frame rate (0 if unknown)
 bool nx_media_has_audio(nx_media_t *m);
 bool nx_media_has_video(nx_media_t *m);
@@ -162,7 +220,50 @@ void nx_media_set_loop(nx_media_t *m, bool loop);
 // into `*buffer_inout` (a caller-owned width*height*4 BGRA buffer; the
 // pointer is exchanged with the ring slot's buffer). Returns true if a new
 // frame was presented. Call from the main thread (e.g. once per host frame).
+//
+// NOT usable on a media opened with `want_hw_decode` that ended up on the
+// hardware path: the ring then holds NV12 planes, which this BGRA
+// pointer-swap API cannot represent. Use nx_media_present_frame() there.
 bool nx_media_present(nx_media_t *m, uint8_t **buffer_inout);
+
+// Present the newest due frame and report its pixel format.
+//
+// This is the format-aware counterpart of nx_media_present(): it points `out`
+// at the frame the ring is currently showing. The pointers stay valid until
+// the next present call on the same media. Returns true when a new frame was
+// presented.
+//
+// `buffer_inout` (optional, 2026-10-21): when non-NULL and the presented
+// frame uses a single buffer (BGRA or planar I420), the ring slot's buffer
+// and the caller's buffer are *exchanged* (pointer swap, zero copy) — the
+// same ownership transfer nx_media_present() performs. After the call
+// `*buffer_inout` points at the frame that was just presented, and the
+// decode thread will not touch it until the slot is recycled. Pass NULL to
+// keep the observe-only behaviour.
+//
+// The two APIs are mutually exclusive on a given media: nx_media_present()
+// takes ownership of the slot buffer (pointer swap), nx_media_present_frame()
+// only observes it unless `buffer_inout` is given.
+bool nx_media_present_frame(nx_media_t *m, nx_media_frame_t *out,
+                             uint8_t **buffer_inout = nullptr);
+
+// Which decode path this media actually took.
+//
+// "hw" — the frames come from the Tegra NVDEC hardware decoder (the ring
+//        holds planar I420, 1.5 B/px, and the host does no colour maths).
+// "sw" — the frames come from the software decoder (the ring holds BGRA, or
+//        planar I420 when the media was opened with want_yuv).
+//
+// The two differ: "hw" is only reported when the hardware decoder really
+// produced the frames, so a caller that asked for hardware decode but got
+// the software fallback sees "sw" here. See nx_media_hw_frames() for the
+// frame count.
+const char *nx_media_decode_mode(nx_media_t *m);
+
+// Number of frames the hardware decoder produced so far (0 when the media
+// never took the hardware path). Written by the decode thread, read by the
+// main thread.
+uint64_t nx_media_hw_frames(nx_media_t *m);
 
 // Current playback position in media seconds (wraps when looping).
 double nx_media_current_time(nx_media_t *m);

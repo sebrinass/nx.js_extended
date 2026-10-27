@@ -241,22 +241,45 @@ export class Video extends EventTarget {
 	/**
 	 * The intrinsic width (in pixels) of the video, or `0` before
 	 * `loadedmetadata`.
+	 *
+	 * The live decoder state wins over the load-time snapshot: a source
+	 * whose container carries no size (a raw H.264 feed has no moov) gets
+	 * its width from the first key frame's SPS, and that is only known
+	 * once a frame has been decoded.
 	 */
 	get videoWidth(): number {
-		return _(this).metadata?.width ?? 0;
+		const i = _(this);
+		if (!i.metadata) return 0;
+		const state = $.videoState(handleOf(this));
+		return state?.width || i.metadata.width || 0;
 	}
 
 	/**
 	 * The intrinsic height (in pixels) of the video, or `0` before
 	 * `loadedmetadata`.
+	 *
+	 * @see {@link videoWidth} for why the live state wins.
 	 */
 	get videoHeight(): number {
-		return _(this).metadata?.height ?? 0;
+		const i = _(this);
+		if (!i.metadata) return 0;
+		const state = $.videoState(handleOf(this));
+		return state?.height || i.metadata.height || 0;
 	}
 
+	/**
+	 * The duration of the video in seconds, or `NaN` when the source has
+	 * no known duration (a streamed feed with no container carries no
+	 * length -- that is "unknown", not "zero seconds").
+	 */
 	get duration(): number {
 		const i = _(this);
 		if (!i.metadata) return NaN;
+		// The native reports an unknown duration as duration=0 +
+		// durationKnown=false; map that back to NaN.
+		if (i.metadata.durationKnown === false) return NaN;
+		const state = $.videoState(handleOf(this));
+		if (state?.durationKnown) return state.duration ?? i.metadata.duration;
 		return i.metadata.duration;
 	}
 

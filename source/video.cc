@@ -53,6 +53,8 @@ void reset_media(nx_video_t *v) {
 	free(v->image.data);
 	v->image.data = nullptr;
 	v->image.width = v->image.height = 0;
+	v->image.is_yuv = false;
+	v->image.yuv_colorspace = 0;
 }
 
 void close_video(nx_video_t *v) {
@@ -107,15 +109,31 @@ struct video_load_t {
 	// concurrent reset/close on the main thread can never unpin it.
 	std::shared_ptr<BackingStore> mem_store;
 	nx_media_t *media = nullptr;
+	// [video] want_yuv — captured here (the JS thread) because the open
+	// itself runs on a worker thread with no access to the engine context.
+	bool want_yuv = true;
 	char err_buf[256] = {};
 	~video_load_t() { free(path); }
 };
 
 void video_load_work(nx_work_t *req) {
 	video_load_t *data = (video_load_t *)req->data;
+	// want_yuv: the decoded frame stays planar I420 (Y|U|V, 1.5 B/px) and
+	// the GPU does the YUV->RGB (Skia's YUVA image path in canvas.cc).
+	// That is 2.6x less per-frame texture upload than BGRA, which is the
+	// dominant per-frame cost on the Switch's Mesa-nouveau GL.
+	//
+	// want_hw_decode: ask for the Tegra NVDEC hardware decoder.  The
+	// decoder falls back to software on its own (no NVDEC device,
+	// unsupported codec or resolution, avcodec_open2() refusing the
+	// hardware pixel format), and the ring holds the same planar I420
+	// either way -- so the consumer has ONE code path and the fallback
+	// is invisible to the page.
 	data->media =
 	    nx_media_open(data->path, data->mem, data->mem_size, data->mem_store,
-	                  data->err_buf, sizeof(data->err_buf));
+	                  data->err_buf, sizeof(data->err_buf),
+	                  /*want_yuv=*/data->want_yuv, /*net=*/nullptr, /*av_err=*/nullptr,
+	                  /*abort_flag=*/nullptr, /*want_hw_decode=*/true);
 }
 
 MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
@@ -140,19 +158,30 @@ MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
 	int width = nx_media_width(data->media);
 	int height = nx_media_height(data->media);
 	if (nx_media_has_video(data->media)) {
-		uint8_t *buf = (uint8_t *)nx_alloc(iso, (size_t)width * height * 4);
+		// The media is opened with want_yuv, so the frames are planar I420
+		// (Y|U|V contiguous) -- the layout Skia's YUVA path expects.  Size
+		// the presentation buffer exactly like the media sizes its ring
+		// slots (nx_media_i420_size), because the two are swapped on every
+		// present.
+		const size_t buf_size = nx_media_i420_size(width, height);
+		uint8_t *buf = (uint8_t *)nx_alloc(iso, buf_size);
 		if (!buf) {
 			nx_media_destroy(v->media);
 			v->media = nullptr;
 			return MaybeLocal<Value>();
 		}
-		memset(buf, 0, (size_t)width * height * 4);
-		// Opaque black until the first frame presents.
-		for (size_t i = 3; i < (size_t)width * height * 4; i += 4)
-			buf[i] = 0xff;
+		// Opaque black until the first frame presents: Y = 0 is black in
+		// both the limited and the full range, U = V = 128 is neutral
+		// chroma.
+		memset(buf, 0, buf_size);
+		const size_t cw = (size_t)((width + 1) / 2) * (size_t)((height + 1) / 2);
+		memset(buf + (size_t)width * height, 128, cw * 2);
 		v->image.width = (uint32_t)width;
 		v->image.height = (uint32_t)height;
 		v->image.data = buf;
+		// Planar-I420 frame: canvas.cc builds a GPU YUVA SkImage for it
+		// instead of copying the pixels into a BGRA raster image.
+		v->image.is_yuv = true;
 	}
 	Local<Object> result = Object::New(iso);
 	result->Set(context, nx_str(iso, "width"), Integer::New(iso, width))
@@ -162,6 +191,13 @@ MaybeLocal<Value> video_load_after(Isolate *iso, nx_work_t *req) {
 	result
 	    ->Set(context, nx_str(iso, "duration"),
 	          Number::New(iso, nx_media_duration(data->media)))
+	    .Check();
+	// Whether `duration` is a real length. False for a source with no
+	// container duration (a streamed feed has no moov) -> the JS layer
+	// reports NaN there instead of a made-up 0.
+	result
+	    ->Set(context, nx_str(iso, "durationKnown"),
+	          Boolean::New(iso, nx_media_duration_known(data->media)))
 	    .Check();
 	result
 	    ->Set(context, nx_str(iso, "hasAudio"),
@@ -186,6 +222,10 @@ void nx_video_load(const FunctionCallbackInfo<Value> &info) {
 	reset_media(v); // support changing `src`
 	NX_INIT_WORK_T_CPP(video_load_t);
 	data->video = v;
+	// [video] want_yuv（见 config.h）—— 决定帧是走**平面 I420 + GPU YUVA**
+	// 还是 **swscale → BGRA**。默认 true；改成 false 就是「全链路走 CPU 转换」
+	// 那个决定性实验（docs/46 §实验 1）。
+	data->want_yuv = nx_ctx(iso)->config.want_yuv;
 	data->video_val.Reset(iso, info[0]);
 	if (info[1]->IsString()) {
 		String::Utf8Value path(iso, info[1]);
@@ -246,7 +286,18 @@ void nx_video_tick(const FunctionCallbackInfo<Value> &info) {
 	nx_video_t *v = get_video(iso, info[0]);
 	if (!v || !v->media || !v->image.data)
 		return;
-	if (nx_media_present(v->media, &v->image.data)) {
+	// Format-aware present: the frame is planar I420 (the media is opened
+	// with want_yuv) and the buffer is swapped with the ring slot's, so
+	// the decode thread never writes into the frame we are about to draw.
+	nx_media_frame_t frame;
+	if (nx_media_present_frame(v->media, &frame, &v->image.data)) {
+		// Re-derive the image flags every frame: the decoder may switch
+		// between the hardware and the software path, and the colour
+		// space tag comes from the stream's colorimetry.
+		v->image.is_yuv = frame.format == NX_MEDIA_PIXFMT_I420;
+		v->image.yuv_colorspace = frame.colorspace;
+		v->image.width = (uint32_t)frame.width;
+		v->image.height = (uint32_t)frame.height;
 		nx_image_release_cache(&v->image);
 		info.GetReturnValue().Set(true);
 	} else {
@@ -286,6 +337,38 @@ void nx_video_state(const FunctionCallbackInfo<Value> &info) {
 	result
 	    ->Set(context, nx_str(iso, "droppedFrames"),
 	          Number::New(iso, (double)nx_media_dropped_frames(v->media)))
+	    .Check();
+	// Which decode path this media took: "hw" (Tegra NVDEC) or "sw"
+	// (software fallback).  Together with hwFrames this answers "is the
+	// hardware decoder actually running?" from the page.
+	result
+	    ->Set(context, nx_str(iso, "decodeMode"),
+	          nx_str(iso, nx_media_decode_mode(v->media)))
+	    .Check();
+	result
+	    ->Set(context, nx_str(iso, "hwFrames"),
+	          Number::New(iso, (double)nx_media_hw_frames(v->media)))
+	    .Check();
+	// The media's own metadata, as the decoder knows it RIGHT NOW. The
+	// load-time metadata is a snapshot; these are the live numbers, and
+	// they are what a source without a container (a raw H.264 feed, whose
+	// size comes from the first key frame's SPS) ends up reporting once
+	// the decoder has seen a frame.
+	result
+	    ->Set(context, nx_str(iso, "width"),
+	          Integer::New(iso, nx_media_width(v->media)))
+	    .Check();
+	result
+	    ->Set(context, nx_str(iso, "height"),
+	          Integer::New(iso, nx_media_height(v->media)))
+	    .Check();
+	result
+	    ->Set(context, nx_str(iso, "duration"),
+	          Number::New(iso, nx_media_duration(v->media)))
+	    .Check();
+	result
+	    ->Set(context, nx_str(iso, "durationKnown"),
+	          Boolean::New(iso, nx_media_duration_known(v->media)))
 	    .Check();
 	const char *err = nx_media_error(v->media);
 	if (err) {

@@ -2,6 +2,7 @@ import { $ } from './$';
 import { resolveDns } from './switch/dns';
 import { EventTarget } from './polyfills/event-target';
 import { SocketEvent, type SocketAddress, type SocketInfo } from './switch';
+import { abortWritable, cancelReadable } from './stream-teardown';
 import {
 	assertInternalConstructor,
 	bufferSourceToArrayBuffer,
@@ -219,12 +220,13 @@ export class Socket {
 		// readable (whose cancel handler re-enters close()).
 		i.readBuffer = undefined; // release the large read buffer promptly
 		i.opened.reject(reason);
-		if (!this.readable.locked) {
-			this.readable.cancel(reason);
-		}
-		if (!this.writable.locked) {
-			this.writable.abort(reason);
-		}
+		// `cancel()` / `abort()` return a REJECTED promise when the stream is
+		// locked or already errored. Dropping it would surface as a global
+		// `unhandledrejection` (engine patch 0036), so the guarded helpers are
+		// used here as well — `close()` is on the same teardown path as the
+		// fetch abort. See src/stream-teardown.ts.
+		cancelReadable(this.readable, reason, '[socket] close');
+		abortWritable(this.writable, reason, '[socket] close');
 		if (i.tls) {
 			// TLS context owns its fd; tear it down natively (closes the
 			// uv_poll_t then the fd). Never $.close the fd directly.

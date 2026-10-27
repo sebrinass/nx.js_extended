@@ -235,6 +235,18 @@ struct nx_audio_node {
 	std::atomic<bool> stream_playing{false};
 	// Ledger #114 diag — counts render quanta where avail < Q (underrun).
 	std::atomic<uint64_t> stream_underrun_count{0};
+	// Last successfully-read frame (L/R), replayed to pad short quanta instead
+	// of silence. Silence padding is heard on device as a periodic comb-filter
+	// "cave" effect; holding the last frame keeps the waveform continuous.
+	// Defaults to {0, 0} = initial silence, which is the correct pre-play state.
+	float stream_last_frame[NX_AUDIO_CHANNELS] = {0, 0};
+	// B1 (0071): PLC-style envelope applied to that hold. Padding frames
+	// scale stream_last_frame by this gain, which DECAYS to silence (x0.8
+	// every 8 frames, gone in ~5 ms) instead of freezing at full amplitude
+	// (0059's "stuck tape" buzz); real frames right after a gap ramp the
+	// gain back to 1.0 (~2.7 ms) so resuming audio does not click. 1.0 =
+	// clean playback. Render-thread-only (process_stream_source).
+	float stream_conceal_gain = 1.f;
 
 	// ---- analyser state (NX_AUDIO_NODE_ANALYSER) ----
 	// Ring of the most-recent downmixed (mono) output samples. Written by the
@@ -417,6 +429,10 @@ uint32_t nx_audio_stream_pending(nx_audio_node *n);
 // Ledger #114 diag — count of render quanta where avail < Q (underrun events).
 // Reset on stream_flush. Read-only snapshot; monotonic during playback.
 uint64_t nx_audio_stream_underrun_count(nx_audio_node *n);
+// Total ring capacity in frames (0 when `n` is not a stream source). A producer
+// that wants to pre-charge the ring uses this to clamp its target so the target
+// can always be reached.
+uint32_t nx_audio_stream_capacity(nx_audio_node *n);
 // Discard all buffered frames (seek/flush). The producer thread MUST be
 // parked while this is called.
 void nx_audio_stream_flush(nx_audio_node *n);

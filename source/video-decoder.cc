@@ -37,6 +37,7 @@
 #include "types.h"
 #include "wrap.h"
 #include <atomic>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,6 +76,11 @@ struct nx_video_decoder_t {
 	// image. Set at construction from the brewser <video> path.
 	bool want_yuv = false;
 	std::atomic<bool> open_done{false};
+	// True when the open ran INLINE on the caller's thread (a local
+	// source). Then the metadata getters are already valid when the
+	// constructor returns; a network source opens on a worker thread and
+	// they read 0 until `ready` flips.
+	bool open_sync = false;
 	// Cancel latch handed to nx_media_open. Set before EVERY join of
 	// open_thread: the open can be parked in a blocking connect/read, and
 	// joining it without this stalls the V8 main thread for the whole
@@ -139,6 +145,68 @@ struct nx_video_decoder_t {
 	float volume = 1.0f;
 };
 
+// Case-insensitive prefix test. The engine builds on hosts without
+// <strings.h>'s strncasecmp, so roll the four lines by hand.
+static bool starts_with_ci(const std::string &s, const char *prefix) {
+	size_t n = strlen(prefix);
+	if (s.size() < n)
+		return false;
+	for (size_t i = 0; i < n; i++) {
+		char a = s[i];
+		char b = prefix[i];
+		if (a >= 'A' && a <= 'Z')
+			a = (char)(a - 'A' + 'a');
+		if (b >= 'A' && b <= 'Z')
+			b = (char)(b - 'A' + 'a');
+		if (a != b)
+			return false;
+	}
+	return true;
+}
+
+// True when the URL names a source on the local filesystem.
+//
+// Why this matters (patch 0018, 2026-10-22): the open was made ASYNCHRONOUS
+// on 2026-09-05 so that a network source (HLS: avformat_open_input() blocks
+// on the playlist + segment fetches) would not freeze the JS main thread.
+// But that change made EVERY open async -- and until the open thread
+// publishes the media, ready_media() returns nullptr, so EVERY metadata
+// getter (width / height / duration / fps) reads 0.
+//
+// brewser-runtime's <video> element is built on this decoder (see the
+// `want_yuv` comment above) and reads those getters right after
+// `new VideoDecoder(url)` -- the only moment it has before the first frame
+// arrives. It therefore saw 0x0 and "no duration" and the element reported
+// videoWidth=0, videoHeight=0, duration=NaN, even though the video itself
+// played perfectly (the frames come later, through nextFrame()).
+//
+// A local file needs none of that: the demuxer just probes it, which takes
+// milliseconds. So local sources go back to opening INLINE, and the
+// metadata is correct the moment the constructor returns. Network sources
+// keep the async open untouched.
+static bool is_local_source(const std::string &url) {
+	// Network -> async open (unchanged).
+	if (starts_with_ci(url, "http://"))
+		return false;
+	if (starts_with_ci(url, "https://"))
+		return false;
+	// The engine's own local schemes.
+	if (starts_with_ci(url, "sdmc:"))
+		return true;
+	if (starts_with_ci(url, "romfs:"))
+		return true;
+	if (starts_with_ci(url, "file:"))
+		return true;
+	if (starts_with_ci(url, "nxjs:"))
+		return true;
+	// Any other "scheme://" -> unknown -> treat it as network (async,
+	// unchanged behaviour).
+	if (url.find("://") != std::string::npos)
+		return false;
+	// A plain path -> local.
+	return true;
+}
+
 // Media handle once the async open has published it, else nullptr. The
 // `open_done` acquire load pairs with the open thread's release store so the
 // `media` write is visible before we read it.
@@ -156,6 +224,81 @@ static void apply_pending_on_ready(nx_video_decoder_t *d, nx_media_t *m) {
 		nx_media_seek(m, d->seek_target.load(std::memory_order_relaxed));
 	if (d->play_requested.load(std::memory_order_relaxed))
 		nx_media_play(m);
+}
+
+// A short, credential-free description of a media source, for the
+// diagnostic lines: the scheme plus the file name.
+//
+// NOT the full URL: a network source can carry a signed query string, and
+// these lines end up in nxjs-debug.log, which gets read back into the repo.
+// Everything after a '?' is dropped, and only the last path segment is kept.
+static std::string describe_source(const std::string &url) {
+	size_t q = url.find('?');
+	std::string u = (q == std::string::npos) ? url : url.substr(0, q);
+	std::string scheme = "file";
+	size_t colon = u.find(':');
+	if (colon != std::string::npos) {
+		bool scheme_like = colon > 0;
+		for (size_t i = 0; i < colon && scheme_like; i++) {
+			char c = u[i];
+			if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			      (c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'))
+				scheme_like = false;
+		}
+		if (scheme_like)
+			scheme = u.substr(0, colon);
+	}
+	size_t slash = u.find_last_of('/');
+	std::string name = (slash == std::string::npos) ? u : u.substr(slash + 1);
+	if (name.empty())
+		name = "-";
+	return scheme + ":" + name;
+}
+
+// Open the media and publish it (or the error that stopped it).
+//
+// Runs on the open thread for a network source and INLINE on the caller's
+// thread for a local one (see is_local_source). Either way the result is
+// published the same way: `media` (or `open_err`) is written first and
+// `open_done` is then released, so a reader that acquires `open_done` sees
+// the media.
+static void open_media(nx_video_decoder_t *d) {
+	char err[256] = {};
+	// Empty string -> NULL so nx_media_open applies its own default UA
+	// (and sends no Referer) rather than setting an empty header.
+	const nx_media_net_t net = {
+	    d->open_user_agent.empty() ? nullptr : d->open_user_agent.c_str(),
+	    d->open_referer.empty() ? nullptr : d->open_referer.c_str(),
+	};
+	int av_err = 0;
+	nx_media_t *m = nx_media_open(d->open_url.c_str(), nullptr, 0,
+	                              nullptr, err, sizeof(err), d->want_yuv,
+	                              &net, &av_err, &d->open_abort,
+	                              /*want_hw_decode=*/true);
+	if (m) {
+		if (d->open_want_loop) nx_media_set_loop(m, true);
+		d->media = m; // made visible by the open_done release store
+	} else {
+		snprintf(d->open_err, sizeof(d->open_err), "%s", err);
+		d->open_av_err = av_err;
+	}
+	d->open_done.store(true, std::memory_order_release);
+	// One-line open summary (patch 0018): the numbers the page is supposed
+	// to see on <video>. `dur_known=0` means the source carries NO
+	// container duration (a streamed H.264 feed has no moov) -> the JS
+	// layer reports NaN there, never a made-up length. `sync=1` means the
+	// open already finished and the metadata getters are valid right now.
+	fprintf(stderr,
+	        "[vmd] open: sync=%d %dx%d dur=%.3f dur_known=%d fps=%.3f "
+	        "has_audio=%d has_video=%d src=%s\n",
+	        d->open_sync ? 1 : 0, m ? nx_media_width(m) : 0,
+	        m ? nx_media_height(m) : 0, m ? nx_media_duration(m) : 0.0,
+	        (m && nx_media_duration_known(m)) ? 1 : 0,
+	        m ? nx_media_content_fps(m) : 0.0,
+	        (m && nx_media_has_audio(m)) ? 1 : 0,
+	        (m && nx_media_has_video(m)) ? 1 : 0,
+	        describe_source(d->open_url).c_str());
+	fflush(stderr);
 }
 
 void free_video_decoder(nx_video_decoder_t *d) {
@@ -238,38 +381,26 @@ void nx_video_decoder_new(const FunctionCallbackInfo<Value> &info) {
 		// wrapper once the (async) open reports a usable audio stream.
 	}
 
-	// Async open: hand the URL to a worker thread and return a "pending"
-	// decoder immediately so the JS main thread never blocks on the network
-	// open. width/height/duration read 0 and nextFrame() returns null until
-	// open_thread publishes the media; frame_buf is allocated lazily in
-	// next_frame() once the real dimensions are known.
 	nx_video_decoder_t *d = new nx_video_decoder_t();
 	d->open_url = url;
 	d->open_want_loop = want_loop;
 	d->want_yuv = want_yuv;
 	d->open_user_agent = std::move(opt_user_agent);
 	d->open_referer = std::move(opt_referer);
-	d->open_thread = std::thread([d]() {
-		char err[256] = {};
-		// Empty string -> NULL so nx_media_open applies its own default UA
-		// (and sends no Referer) rather than setting an empty header.
-		const nx_media_net_t net = {
-		    d->open_user_agent.empty() ? nullptr : d->open_user_agent.c_str(),
-		    d->open_referer.empty() ? nullptr : d->open_referer.c_str(),
-		};
-		int av_err = 0;
-		nx_media_t *m = nx_media_open(d->open_url.c_str(), nullptr, 0,
-		                              nullptr, err, sizeof(err), d->want_yuv,
-		                              &net, &av_err, &d->open_abort);
-		if (m) {
-			if (d->open_want_loop) nx_media_set_loop(m, true);
-			d->media = m; // made visible by the open_done release store
-		} else {
-			snprintf(d->open_err, sizeof(d->open_err), "%s", err);
-			d->open_av_err = av_err;
-		}
-		d->open_done.store(true, std::memory_order_release);
-	});
+	// Local source -> open INLINE, so width/height/duration/fps are valid
+	// the moment this function returns (see is_local_source for why).
+	// Network source -> async open: hand the URL to a worker thread and
+	// return a "pending" decoder immediately so the JS main thread never
+	// blocks on the network open. width/height/duration read 0 and
+	// nextFrame() returns null until open_thread publishes the media;
+	// frame_buf is allocated lazily in next_frame() once the real
+	// dimensions are known. `ready` tells the caller when that happened.
+	if (is_local_source(d->open_url)) {
+		d->open_sync = true;
+		open_media(d);
+	} else {
+		d->open_thread = std::thread([d]() { open_media(d); });
+	}
 
 	Local<Object> obj = nx::NewWrapped(iso);
 	nx::Wrap<nx_video_decoder_t>(iso, obj, d, free_video_decoder);
@@ -534,7 +665,12 @@ void nx_video_decoder_next_frame(const FunctionCallbackInfo<Value> &info) {
 
 	if (!d->frame_buf) return; // audio-only source; nothing to present
 
-	if (!nx_media_present(m, &d->frame_buf)) {
+	// Format-aware present: the hardware decoder (Tegra NVDEC) and the
+	// software decoder both feed the ring the same way, and the buffer is
+	// swapped with the ring slot's so the decode thread cannot overwrite
+	// the frame we are about to copy out.
+	nx_media_frame_t frame;
+	if (!nx_media_present_frame(m, &frame, &d->frame_buf)) {
 		// Media clock says no new frame is due yet.
 		return;
 	}
@@ -633,15 +769,35 @@ void nx_vd_get_height(const FunctionCallbackInfo<Value> &info) {
 	info.GetReturnValue().Set(Integer::New(info.GetIsolate(),
 	                                        m ? nx_media_height(m) : 0));
 }
+// The container duration in seconds, or NaN when the source has none.
+//
+// NaN, not 0: "unknown length" is what a streamed feed has (no moov, so no
+// total duration), and the HTML convention for an unknown duration is NaN
+// (the engine's <audio> element does the same). A shell that maps this onto
+// a <video> element therefore reports NaN instead of a made-up "0 seconds".
 void nx_vd_get_duration(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
 	nx_media_t *m = ready_media(d);
-	info.GetReturnValue().Set(Number::New(info.GetIsolate(),
-	                                       m ? nx_media_duration(m) : 0.0));
+	const double dur =
+	    (m && nx_media_duration_known(m)) ? nx_media_duration(m) : NAN;
+	info.GetReturnValue().Set(Number::New(info.GetIsolate(), dur));
 }
 // Content frame rate (0 while opening / unknown). The brewser shell reads this
 // to pick the present cadence: >~32fps => keep 60 Hz (don't engage the 30 Hz
 // video pacing lock, which would halve 60fps content to 30 shown fps).
+// videoDecoderReady -> true once the open finished (with a media or with an
+// error). False while a NETWORK open is still in flight -- for a local
+// source the open is synchronous, so it is already true here.
+//
+// This is the flag an embedder should watch before it reads width/height/
+// duration: those getters read 0 until the open has landed.
+void nx_vd_get_ready(const FunctionCallbackInfo<Value> &info) {
+	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
+	info.GetReturnValue().Set(
+	    Boolean::New(info.GetIsolate(),
+	                 d && d->open_done.load(std::memory_order_acquire)));
+}
+
 void nx_vd_get_fps(const FunctionCallbackInfo<Value> &info) {
 	nx_video_decoder_t *d = nx::Unwrap<nx_video_decoder_t>(info.This());
 	nx_media_t *m = ready_media(d);
@@ -758,6 +914,7 @@ void nx_video_decoder_init_class(const FunctionCallbackInfo<Value> &info) {
 	NX_DEF_GET(proto, "height", nx_vd_get_height);
 	NX_DEF_GET(proto, "duration", nx_vd_get_duration);
 	NX_DEF_GET(proto, "fps", nx_vd_get_fps);
+	NX_DEF_GET(proto, "ready", nx_vd_get_ready);
 	NX_DEF_GET(proto, "error", nx_vd_get_error);
 	NX_DEF_GET(proto, "errorKind", nx_vd_get_error_kind);
 	NX_DEF_GET(proto, "ended", nx_vd_get_ended);

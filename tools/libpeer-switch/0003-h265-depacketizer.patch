@@ -1,0 +1,781 @@
+H.265 / HEVC support for libpeer (extern/libpeer).
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place: the next `git submodule update` would throw the changes away.  This
+patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built
+(it is the third patch of that series, after 0001-switch-webrtc-fixes and
+0002-no-stdout-log).
+
+Why
+---
+The Mihoyo cloud sends H.265 when the official web page runs in its
+NativeH265 mode: its offer carries "a=rtpmap:96 H265/90000" (the real,
+captured offer: pc/analysis/data/mihoyo-offer-sdp.redacted.txt).  Until
+now libpeer had NO H.265 depacketizer at all -- rtp_decoder_init() knew
+CODEC_H264, CODEC_PCMA, CODEC_PCMU and CODEC_OPUS and nothing else -- so
+every H.265 RTP packet was dropped on the floor.
+
+What it adds
+------------
+1. RFC 7798 (RTP Payload Format for HEVC) support in src/rtp.c:
+
+   * rtp_decode_h265()      -- the video depacketizer.  It dispatches on
+                               the Type field of the 2 byte payload header:
+                                 1..47 single NAL unit packet
+                                 48    aggregation packet (AP)
+                                 49    fragmentation unit (FU)
+                                 50    PACI (ignored)
+   * rtp_decode_h265_ap()   -- RFC 7798 section 4.4.2.  Splits the
+                               aggregation units ("DONL | NALU size | NALU"
+                               for the first one, "DOND | NALU size | NALU"
+                               for the rest) into single NAL units.
+   * rtp_decode_h265_fu()   -- RFC 7798 section 4.4.3.  Reassembles a
+                               fragmented NAL unit.  The FU payload header
+                               is 2 bytes (F | Type | LayerId | TID), the
+                               FU header is ONE byte (S | E | FuType) and
+                               the optional 16 bit DONL field follows it.
+                               The two byte HEVC NAL unit header is rebuilt
+                               out of the payload header (F / FuType /
+                               LayerId / TID) and prepended to the fragment
+                               data, so the result is a valid NAL unit.
+
+   The access unit is assembled exactly like the H.264 one does it: the
+   NAL units are written into the access unit buffer with a 4 byte Annex-B
+   start code and the access unit is handed to on_video_packet() when the
+   RTP marker bit arrives.
+
+2. The parameter sets travel IN BAND.  The cloud's offer has no
+   "sprop-parameter-sets" (its fmtp is only
+   "level-id=120;profile-id=1;profile-space=0;tier-flag=0"), so VPS (NAL
+   32), SPS (NAL 33) and PPS (NAL 34) arrive inside the stream.
+   rtp_decoder_append_h265_nalu() caches them and puts the cached ones
+   back in front of every IRAP picture (NAL 16..23) that needs them --
+   the H.264 path does the same for SPS/PPS.
+
+3. The payload type of the H.265 stream is NOT a constant: the peer
+   numbers the codecs in ITS offer (H.265 is 96 there, H.264 is 98) and
+   the answer has to use the very same numbers.  So:
+     * peer_connection_set_video_h265_payload_type() hands the number over,
+     * rtp_decode_video() picks the depacketizer by the RTP payload type,
+       which keeps H.264 working no matter which of the two the peer
+       decides to send.
+   peer_connection_set_video_codec() switches the codec of a live
+   connection: it changes both the codec that is advertised in the local
+   description (the description is built when it is created, so call it
+   BEFORE peer_connection_create_answer()) and the codec the inbound
+   depacketizer runs.
+
+4. sdp_append_h264_h265() advertises H.264 (payload type 96) AND H.265
+   (payload type 97) in the same video section.  RFC 3264 section 6.1
+   lets the answerer reduce the payload type list, and the answer may
+   lose its H.265 payload types on the way to the peer -- advertising both
+   keeps the video section usable in that case.
+
+5. peer_connection_set_video_h265_don() enables the DONL field of the
+   FU payload (RFC 7798 section 4.4.3).  The DONL field is only present
+   when the SDP announces "sprop-max-don-diff > 0"; the cloud does not
+   use it, so it is off by default.
+
+Note: the blank context lines below are empty instead of a single space.
+git apply accepts both, and this way the patch file itself carries no
+trailing whitespace.
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index 7afa1b0..3d0e7c6 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -58,6 +58,11 @@ struct PeerConnection {
+   RtpEncoder artp_encoder;
+   RtpEncoder vrtp_encoder;
+   RtpDecoder vrtp_decoder;
++  // The RTP payload type of the H.265 stream (RFC 7798).  It is not a
++  // constant: the peer numbers it in its offer.
++  int video_h265_payload_type;
++  // Whether the H.265 payload carries the DONL field (RFC 7798 4.4.3).
++  int video_h265_don;
+   RtpDecoder artp_decoder;
+
+   uint32_t remote_assrc;
+@@ -498,6 +503,46 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
+   return pc;
+ }
+
++int peer_connection_set_video_codec(PeerConnection* pc, MediaCodec codec) {
++  if (!pc)
++    return -1;
++  if (codec != CODEC_H264 && codec != CODEC_H265)
++    return -1;
++  if (pc->config.video_codec == codec)
++    return 0;
++
++  pc->config.video_codec = codec;
++
++  // The decoder is rebuilt for the new codec.  The negotiated payload
++  // types and the DONL flag have to survive that.
++  rtp_decoder_cleanup(&pc->vrtp_decoder);
++  rtp_decoder_init(&pc->vrtp_decoder, codec, pc->config.onvideotrack, pc->config.user_data);
++  rtp_decoder_set_video_callback(&pc->vrtp_decoder, pc->config.onvideopacket);
++  pc->vrtp_decoder.h265_payload_type = (uint8_t)pc->video_h265_payload_type;
++  pc->vrtp_decoder.h265_has_donl = (uint8_t)(pc->video_h265_don ? 1 : 0);
++  pc->video_has_last_nack = 0;
++  memset(&pc->video_receiver_stats, 0, sizeof(pc->video_receiver_stats));
++  return 0;
++}
++
++int peer_connection_set_video_h265_payload_type(PeerConnection* pc, int payload_type) {
++  if (!pc)
++    return -1;
++  if (payload_type < 0 || payload_type > 127)
++    return -1;
++  pc->video_h265_payload_type = payload_type;
++  pc->vrtp_decoder.h265_payload_type = (uint8_t)payload_type;
++  return 0;
++}
++
++int peer_connection_set_video_h265_don(PeerConnection* pc, int enable) {
++  if (!pc)
++    return -1;
++  pc->video_h265_don = enable ? 1 : 0;
++  pc->vrtp_decoder.h265_has_donl = (uint8_t)(enable ? 1 : 0);
++  return 0;
++}
++
+ void peer_connection_destroy(PeerConnection* pc) {
+   if (pc) {
+     rtp_decoder_cleanup(&pc->artp_decoder);
+@@ -1041,6 +1086,13 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
+
+   if (pc->config.video_codec == CODEC_H264) {
+     sdp_append_h264(pc->sdp);
++  } else if (pc->config.video_codec == CODEC_H265) {
++    // Both codecs are advertised: the peer may drop the H.265 payload
++    // types from the answer (RFC 3264 section 6.1 allows the answerer to
++    // reduce the payload type list), and the connection has to stay alive
++    // in that case.  The RTP payload type tells the depacketizer which
++    // codec really arrives.
++    sdp_append_h264_h265(pc->sdp);
+   }
+
+   switch (pc->config.audio_codec) {
+diff --git a/src/peer_connection.h b/src/peer_connection.h
+index c3105e3..ccad642 100644
+--- a/src/peer_connection.h
++++ b/src/peer_connection.h
+@@ -52,6 +52,7 @@ typedef enum MediaCodec {
+
+   /* Video */
+   CODEC_H264,
++  CODEC_H265,   // RFC 7798 (HEVC over RTP)
+   CODEC_VP8,    // not implemented yet
+   CODEC_MJPEG,  // not implemented yet
+
+@@ -128,6 +129,48 @@ void* peer_connection_get_sctp(PeerConnection* pc);
+
+ PeerConnection* peer_connection_create(PeerConfiguration* config);
+
++/**
++ * @brief switch the video codec of a live connection.
++ *
++ * The video codec is negotiated, not fixed: the remote offer tells which
++ * codecs the peer can send and the answer has to name one of them.  This
++ * call therefore changes BOTH the codec that is advertised in the local
++ * description (the description is built when it is created, so call this
++ * BEFORE peer_connection_create_answer()) and the codec the inbound RTP
++ * depacketizer runs.
++ *
++ * @param[in] pc     the peer connection
++ * @param[in] codec  CODEC_H264 or CODEC_H265
++ * @return 0 on success, -1 when the codec is not supported
++ */
++int peer_connection_set_video_codec(PeerConnection* pc, MediaCodec codec);
++
++/**
++ * @brief tell the video depacketizer which RTP payload type carries H.265.
++ *
++ * The payload type is NOT a constant: the peer numbers the codecs in ITS
++ * offer and the answer has to use the very same numbers, so the number of
++ * the H.265 stream has to be handed over.  When it is not (0), every video
++ * packet is treated as H.264.
++ *
++ * @param[in] pc            the peer connection
++ * @param[in] payload_type  the RTP payload type of the H.265 stream
++ * @return 0 on success, -1 on error
++ */
++int peer_connection_set_video_h265_payload_type(PeerConnection* pc, int payload_type);
++
++/**
++ * @brief enable / disable the DONL field of the H.265 payload (RFC 7798).
++ *
++ * The 16 bit decoding order number is only present when the SDP announces
++ * sprop-max-don-diff > 0.  The cloud does not use it.
++ *
++ * @param[in] pc     the peer connection
++ * @param[in] enable 1 when the DONL field is present
++ * @return 0 on success, -1 on error
++ */
++int peer_connection_set_video_h265_don(PeerConnection* pc, int enable);
++
+ void peer_connection_set_diagnostics_enabled(int enabled);
+ void peer_connection_set_diagnostic_callback(void (*callback)(const char*));
+
+diff --git a/src/rtp.c b/src/rtp.c
+index c6b1b5c..2a82b0f 100644
+--- a/src/rtp.c
++++ b/src/rtp.c
+@@ -601,6 +601,416 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+   }
+ }
+
++// ---------------------------------------------------------------------------
++// H.265 / HEVC (RFC 7798)
++//
++// The RTP payload format of HEVC has four packet types (RFC 7798 section
++// 4.4).  The Type field of the 2 byte payload header tells them apart:
++//
++//   1..47  single NAL unit packet  (the payload header IS the NAL header)
++//   48     aggregation packet (AP) -- several small NAL units in one packet
++//   49     fragmentation unit (FU)  -- one big NAL unit split over packets
++//   50     PACI                        (not needed here)
++//
++// The payload header is the HEVC NAL unit header:
++//
++//    0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//   |F|   Type    |  LayerId  |   TID   |
++//   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++//
++// and the FU adds ONE byte of FU header (S | E | FuType) plus an optional
++// 16 bit DONL field.
++//
++// The parameter sets (VPS = 32, SPS = 33, PPS = 34) travel IN BAND: the
++// cloud's offer carries no sprop-parameter-sets, so the decoder caches them
++// and puts them back in front of every IRAP picture that needs them.
++// ---------------------------------------------------------------------------
++
++#define H265_PAYLOAD_AP 48
++#define H265_PAYLOAD_FU 49
++#define H265_PAYLOAD_PACI 50
++
++#define H265_NAL_VPS 32
++#define H265_NAL_SPS 33
++#define H265_NAL_PPS 34
++
++// VCL NAL units are 0..31, the IRAP VCL ones are 16..23.
++#define H265_NAL_MAX_VCL 31
++#define H265_NAL_IRAP_FIRST 16
++#define H265_NAL_IRAP_LAST 23
++// A single NAL unit packet carries a NAL unit of type 1..47 (the VCL ones
++// plus VPS / SPS / PPS / AUD / SEI / ...).  48..50 are the special
++// packetization types and never appear as a NAL unit type.
++#define H265_NAL_MAX_SINGLE 47
++
++// The HEVC NAL unit header is two bytes wide.
++#define H265_NAL_HEADER_SIZE 2
++
++// Split the 2 byte HEVC payload header into its fields.
++static void h265_parse_payload_header(const uint8_t* payload, uint8_t* f, uint8_t* type,
++                                       uint8_t* layer_id, uint8_t* tid) {
++  *f = (uint8_t)((payload[0] & 0x80) >> 7);
++  *type = (uint8_t)((payload[0] & 0x7e) >> 1);
++  *layer_id = (uint8_t)(((payload[0] & 0x01) << 5) | (payload[1] >> 3));
++  *tid = (uint8_t)(payload[1] & 0x07);
++}
++
++// Rebuild a HEVC NAL unit header out of the payload header fields.
++static void h265_write_nal_header(uint8_t* out, uint8_t f, uint8_t type, uint8_t layer_id,
++                                  uint8_t tid) {
++  out[0] = (uint8_t)((f << 7) | ((type & 0x3f) << 1) | ((layer_id >> 5) & 0x01));
++  out[1] = (uint8_t)(((layer_id & 0x1f) << 3) | (tid & 0x07));
++}
++
++// The NAL unit type of a HEVC NAL unit (the payload header is the NAL
++// header for a single NAL unit packet).
++static uint8_t h265_nal_type(const uint8_t* nal) {
++  return (uint8_t)((nal[0] & 0x7e) >> 1);
++}
++
++// Append one complete HEVC NAL unit to the access unit that is being
++// assembled.  Mirrors rtp_decoder_append_access_unit_nalu() of the H.264
++// path, but with the HEVC parameter sets.
++//
++// The NAL unit header and the NAL unit payload do not have to be
++// contiguous: RFC 7798 section 4.4.1 puts the DONL between them in a
++// single NAL unit packet that carries one.
++static int rtp_decoder_append_h265_nalu_parts(RtpDecoder* rtp_decoder, const uint8_t* header,
++                                               size_t header_size, const uint8_t* body, size_t body_size) {
++  static const uint8_t nalu_start_4bytecode[] = {0x00, 0x00, 0x00, 0x01};
++
++  if (!header || header_size < H265_NAL_HEADER_SIZE)
++    return -1;
++
++  const uint8_t type = h265_nal_type(header);
++  if (type == H265_NAL_VPS && header_size + body_size <= sizeof(rtp_decoder->cached_vps)) {
++    memcpy(rtp_decoder->cached_vps, header, header_size);
++    if (body_size)
++      memcpy(rtp_decoder->cached_vps + header_size, body, body_size);
++    rtp_decoder->cached_vps_size = header_size + body_size;
++    rtp_decoder->au_has_vps = 1;
++  } else if (type == H265_NAL_SPS && header_size + body_size <= sizeof(rtp_decoder->cached_sps_h265)) {
++    memcpy(rtp_decoder->cached_sps_h265, header, header_size);
++    if (body_size)
++      memcpy(rtp_decoder->cached_sps_h265 + header_size, body, body_size);
++    rtp_decoder->cached_sps_h265_size = header_size + body_size;
++    rtp_decoder->au_has_sps = 1;
++  } else if (type == H265_NAL_PPS && header_size + body_size <= sizeof(rtp_decoder->cached_pps_h265)) {
++    memcpy(rtp_decoder->cached_pps_h265, header, header_size);
++    if (body_size)
++      memcpy(rtp_decoder->cached_pps_h265 + header_size, body, body_size);
++    rtp_decoder->cached_pps_h265_size = header_size + body_size;
++    rtp_decoder->au_has_pps = 1;
++  }
++
++  // An IRAP picture needs the parameter sets.  When the cloud sends them
++  // in band (which is what it does) they are already part of the access
++  // unit; when they are missing we put the cached ones back in front.
++  if (type >= H265_NAL_IRAP_FIRST && type <= H265_NAL_IRAP_LAST) {
++    if (!rtp_decoder->au_has_vps && rtp_decoder->cached_vps_size > 0) {
++      if (rtp_decoder_append_access_unit_bytes(rtp_decoder, nalu_start_4bytecode, sizeof(nalu_start_4bytecode)) != 0 ||
++          rtp_decoder_append_access_unit_bytes(rtp_decoder, rtp_decoder->cached_vps, rtp_decoder->cached_vps_size) != 0)
++        return -1;
++      rtp_decoder->au_has_vps = 1;
++    }
++    if (!rtp_decoder->au_has_sps && rtp_decoder->cached_sps_h265_size > 0) {
++      if (rtp_decoder_append_access_unit_bytes(rtp_decoder, nalu_start_4bytecode, sizeof(nalu_start_4bytecode)) != 0 ||
++          rtp_decoder_append_access_unit_bytes(rtp_decoder, rtp_decoder->cached_sps_h265, rtp_decoder->cached_sps_h265_size) != 0)
++        return -1;
++      rtp_decoder->au_has_sps = 1;
++    }
++    if (!rtp_decoder->au_has_pps && rtp_decoder->cached_pps_h265_size > 0) {
++      if (rtp_decoder_append_access_unit_bytes(rtp_decoder, nalu_start_4bytecode, sizeof(nalu_start_4bytecode)) != 0 ||
++          rtp_decoder_append_access_unit_bytes(rtp_decoder, rtp_decoder->cached_pps_h265, rtp_decoder->cached_pps_h265_size) != 0)
++        return -1;
++      rtp_decoder->au_has_pps = 1;
++    }
++  }
++
++  if (rtp_decoder_append_access_unit_bytes(rtp_decoder, nalu_start_4bytecode, sizeof(nalu_start_4bytecode)) != 0 ||
++      rtp_decoder_append_access_unit_bytes(rtp_decoder, header, header_size) != 0)
++    return -1;
++  if (body_size && rtp_decoder_append_access_unit_bytes(rtp_decoder, body, body_size) != 0)
++    return -1;
++
++  if (type <= H265_NAL_MAX_VCL)
++    rtp_decoder->au_has_vcl = 1;
++  rtp_decoder->nal_units_completed++;
++
++  return 0;
++}
++
++// Append one complete HEVC NAL unit (header and payload are contiguous).
++static int rtp_decoder_append_h265_nalu(RtpDecoder* rtp_decoder, const uint8_t* data, size_t size) {
++  if (!data || size < H265_NAL_HEADER_SIZE)
++    return -1;
++  return rtp_decoder_append_h265_nalu_parts(rtp_decoder, data, H265_NAL_HEADER_SIZE,
++                                            data + H265_NAL_HEADER_SIZE, size - H265_NAL_HEADER_SIZE);
++}
++
++// RFC 7798 section 4.4.3 -- fragmentation unit.
++//
++//   PayloadHdr (2 bytes, Type = 49) | FU header (1 byte) | DONL (cond) | payload
++//
++// The FU header is S | E | FuType.  The DONL field is present only when the
++// SDP says sprop-max-don-diff > 0 and only in the first fragment (S = 1).
++static int rtp_decode_h265_fu(RtpDecoder* rtp_decoder, uint8_t* payload, size_t payload_size,
++                               uint32_t timestamp, uint8_t marker) {
++  static const uint8_t nalu_start_4bytecode[] = {0x00, 0x00, 0x00, 0x01};
++
++  if (payload_size < H265_NAL_HEADER_SIZE + 1)
++    return -1;
++
++  uint8_t f = 0, payload_type = 0, layer_id = 0, tid = 0;
++  h265_parse_payload_header(payload, &f, &payload_type, &layer_id, &tid);
++
++  const uint8_t fu_header = payload[H265_NAL_HEADER_SIZE];
++  const uint8_t start = (fu_header & 0x80) != 0;
++  const uint8_t end = (fu_header & 0x40) != 0;
++  const uint8_t nal_type = (uint8_t)(fu_header & 0x3f);
++
++  if (start && end)
++    return -1;
++  if (nal_type == 0 || nal_type > H265_NAL_MAX_SINGLE)
++    return -1;
++
++  // Skip the optional DONL field.  It is only there in the first fragment
++  // and only when the peer announced sprop-max-don-diff > 0.
++  size_t offset = H265_NAL_HEADER_SIZE + 1;
++  if (rtp_decoder->h265_has_donl && start) {
++    if (payload_size < offset + 2)
++      return -1;
++    offset += 2;
++  }
++
++  if (start) {
++    uint8_t nal_header[H265_NAL_HEADER_SIZE];
++    h265_write_nal_header(nal_header, f, nal_type, layer_id, tid);
++
++    if (rtp_decoder->fragment_started)
++      rtp_decoder->au_damaged = 1;
++    rtp_decoder->nalu_offset = 0;
++    rtp_decoder->fragment_started = 1;
++    rtp_decoder->fragment_damaged = 0;
++
++    if (rtp_decoder_append(rtp_decoder, nalu_start_4bytecode, sizeof(nalu_start_4bytecode)) != 0 ||
++        rtp_decoder_append(rtp_decoder, nal_header, sizeof(nal_header)) != 0 ||
++        rtp_decoder_append(rtp_decoder, payload + offset, payload_size - offset) != 0) {
++      rtp_decoder_reset_fragment(rtp_decoder);
++      return -1;
++    }
++  } else {
++    if (!rtp_decoder->fragment_started)
++      return -1;
++    // The reconstructed NAL unit header has to stay the same for every
++    // fragment of the same NAL unit: the first byte carries F, the NAL
++    // unit type and the top bit of the layer id.
++    if (rtp_decoder->nalu_offset <= sizeof(nalu_start_4bytecode) + H265_NAL_HEADER_SIZE)
++      return -1;
++    if (rtp_decoder->nalu_buf[sizeof(nalu_start_4bytecode)] !=
++        (uint8_t)((f << 7) | ((nal_type & 0x3f) << 1) | ((layer_id >> 5) & 0x01)))
++      return -1;
++
++    if (rtp_decoder_append(rtp_decoder, payload + offset, payload_size - offset) != 0) {
++      rtp_decoder_reset_fragment(rtp_decoder);
++      return -1;
++    }
++  }
++
++  if (end) {
++    if (!rtp_decoder->fragment_damaged &&
++        rtp_decoder->nalu_offset > sizeof(nalu_start_4bytecode) + H265_NAL_HEADER_SIZE) {
++      // The NAL unit header that was rebuilt out of the payload header is
++      // part of the NAL unit, so it goes into the access unit as well.
++      if (rtp_decoder_append_h265_nalu(rtp_decoder,
++                                       rtp_decoder->nalu_buf + sizeof(nalu_start_4bytecode),
++                                       rtp_decoder->nalu_offset - sizeof(nalu_start_4bytecode)) != 0)
++        rtp_decoder->au_damaged = 1;
++    } else {
++      rtp_decoder->au_damaged = 1;
++    }
++    rtp_decoder_reset_fragment(rtp_decoder);
++  }
++
++  (void)timestamp;
++  (void)marker;
++
++  return (int)payload_size;
++}
++
++// RFC 7798 section 4.4.2 -- aggregation packet.
++//
++//   PayloadHdr (2 bytes, Type = 48) | aggregation unit | aggregation unit | ...
++//
++// The first aggregation unit may carry a 16 bit DONL field, every following
++// one a 8 bit DOND field.  Both are only there when the peer announced
++// sprop-max-don-diff > 0.  Every aggregation unit is a 16 bit NAL unit size
++// (the NAL unit header included) followed by the NAL unit itself.
++static int rtp_decode_h265_ap(RtpDecoder* rtp_decoder, uint8_t* payload, size_t payload_size,
++                               uint32_t timestamp) {
++  size_t offset = H265_NAL_HEADER_SIZE;
++  int appended = 0;
++
++  (void)timestamp;
++
++  while (offset < payload_size) {
++    if (rtp_decoder->h265_has_donl) {
++      // The first aggregation unit carries the DONL, the others the DOND.
++      const size_t don_size = (appended == 0) ? 2 : 1;
++      if (offset + don_size > payload_size) {
++        LOGW("RTP H265: truncated DON field in AP");
++        return -1;
++      }
++      offset += don_size;
++    }
++
++    if (offset + 2 > payload_size) {
++      LOGW("RTP H265: truncated AP size field");
++      return -1;
++    }
++
++    const uint16_t nalu_size = read_be16(payload + offset);
++    offset += 2;
++
++    if (nalu_size < H265_NAL_HEADER_SIZE) {
++      LOGW("RTP H265: invalid AP NALU size %u", nalu_size);
++      return -1;
++    }
++
++    if (offset + nalu_size > payload_size) {
++      LOGW("RTP H265: invalid AP packet");
++      return -1;
++    }
++
++    const uint8_t nalu_type = h265_nal_type(payload + offset);
++    if (nalu_type == H265_PAYLOAD_AP || nalu_type == H265_PAYLOAD_FU || nalu_type == H265_PAYLOAD_PACI) {
++      LOGW("RTP H265: nested packetization in AP");
++      return -1;
++    }
++
++    if (rtp_decoder_append_h265_nalu(rtp_decoder, payload + offset, nalu_size) == 0)
++      appended++;
++
++    offset += nalu_size;
++  }
++
++  return appended > 0 ? (int)payload_size : -1;
++}
++
++// The H.265 video depacketizer.
++static int rtp_decode_h265(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
++  RtpPayloadView view;
++  if (rtp_parse_payload(buf, size, &view) != 0)
++    return -1;
++
++  rtp_decoder->packets_received++;
++
++  const int sequence_gap = rtp_decoder->has_last_seq_number &&
++      (uint16_t)(rtp_decoder->last_seq_number + 1) != view.seq_number;
++  if (sequence_gap) {
++    rtp_decoder->sequence_gaps++;
++    rtp_decoder->au_damaged = 1;
++    if (rtp_decoder->fragment_started) {
++      LOGW("RTP H265: sequence gap inside fragmented NALU (%u -> %u)",
++           rtp_decoder->last_seq_number, view.seq_number);
++      rtp_decoder_reset_fragment(rtp_decoder);
++    }
++  }
++
++  rtp_decoder->last_seq_number = view.seq_number;
++  rtp_decoder->has_last_seq_number = 1;
++  rtp_decoder_begin_access_unit(rtp_decoder, view.timestamp);
++  rtp_decoder->au_ssrc = view.ssrc;
++  if (sequence_gap)
++    rtp_decoder->au_damaged = 1;
++
++  if (view.payload_size < H265_NAL_HEADER_SIZE)
++    return -1;
++
++  uint8_t f = 0, payload_type = 0, layer_id = 0, tid = 0;
++  h265_parse_payload_header(view.payload, &f, &payload_type, &layer_id, &tid);
++
++  switch (payload_type) {
++    case H265_PAYLOAD_AP:
++      rtp_decoder->h265_ap_packets++;
++      if (rtp_decoder->fragment_started)
++        rtp_decoder->au_damaged = 1;
++      rtp_decoder_reset_fragment(rtp_decoder);
++      if (rtp_decode_h265_ap(rtp_decoder, view.payload, view.payload_size, view.timestamp) < 0) {
++        rtp_decoder->au_damaged = 1;
++        if (view.marker)
++          rtp_decoder_flush_access_unit(rtp_decoder);
++        return -1;
++      }
++      if (view.marker)
++        rtp_decoder_flush_access_unit(rtp_decoder);
++      return (int)size;
++    case H265_PAYLOAD_FU: {
++      rtp_decoder->h265_fu_packets++;
++      const int result = rtp_decode_h265_fu(rtp_decoder, view.payload, view.payload_size,
++                                            view.timestamp, view.marker);
++      if (result < 0 || (view.marker && rtp_decoder->fragment_started)) {
++        rtp_decoder->au_damaged = 1;
++        rtp_decoder_reset_fragment(rtp_decoder);
++      }
++      if (view.marker)
++        rtp_decoder_flush_access_unit(rtp_decoder);
++      return result;
++    }
++    case H265_PAYLOAD_PACI:
++      LOGD("RTP H265: PACI packet, ignored");
++      return 0;
++    default:
++      break;
++  }
++
++  // A single NAL unit packet: the payload header IS the NAL unit header,
++  // so the whole payload is the NAL unit.
++  if (payload_type == 0 || payload_type > H265_NAL_MAX_SINGLE) {
++    LOGD("RTP H265: unsupported packetization type %u", payload_type);
++    rtp_decoder->au_damaged = 1;
++    rtp_decoder_reset_fragment(rtp_decoder);
++    return 0;
++  }
++
++  rtp_decoder->h265_single_packets++;
++  if (rtp_decoder->fragment_started)
++    rtp_decoder->au_damaged = 1;
++  rtp_decoder_reset_fragment(rtp_decoder);
++  // RFC 7798 section 4.4.1: the DONL field sits between the payload header
++  // and the NAL unit payload.  It is only there when the SDP announces
++  // "sprop-max-don-diff > 0".
++  if (rtp_decoder->h265_has_donl) {
++    if (view.payload_size < H265_NAL_HEADER_SIZE + 2)
++      return -1;
++    if (rtp_decoder_append_h265_nalu_parts(rtp_decoder, view.payload, H265_NAL_HEADER_SIZE,
++                                            view.payload + H265_NAL_HEADER_SIZE + 2,
++                                            view.payload_size - H265_NAL_HEADER_SIZE - 2) != 0)
++      return -1;
++  } else if (rtp_decoder_append_h265_nalu(rtp_decoder, view.payload, view.payload_size) != 0) {
++    return -1;
++  }
++  if (view.marker)
++    rtp_decoder_flush_access_unit(rtp_decoder);
++  return (int)size;
++}
++
++// The video depacketizer used when both codecs are on the table: the RTP
++// payload type decides which one runs.  The payload types are NOT fixed --
++// the peer numbers them in its offer -- so the owner of the connection
++// hands the H.265 one over (h265_payload_type == 0 -> H.264 only).
++static int rtp_decode_video(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
++  RtpPayloadView view;
++  if (rtp_parse_payload(buf, size, &view) != 0)
++    return -1;
++
++  if (rtp_decoder->h265_payload_type != 0 && view.payload_type == rtp_decoder->h265_payload_type)
++    return rtp_decode_h265(rtp_decoder, buf, size);
++
++  return rtp_decode_h264(rtp_decoder, buf, size);
++}
++
+ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+   RtpPayloadView view;
+   if (rtp_parse_payload(buf, size, &view) != 0)
+@@ -660,6 +1070,32 @@ void rtp_decoder_init(RtpDecoder* rtp_decoder, MediaCodec codec, RtpOnPacket on_
+       }
+       rtp_decoder->decode_func = rtp_decode_h264;
+       break;
++    case CODEC_H265:
++      rtp_decoder->type = PT_H265;
++      rtp_decoder->nalu_capacity = CONFIG_MAX_NALU_SIZE;
++      rtp_decoder->nalu_buf = malloc(rtp_decoder->nalu_capacity);
++      rtp_decoder->au_capacity = CONFIG_MAX_NALU_SIZE;
++      rtp_decoder->au_buf = malloc(rtp_decoder->au_capacity);
++      rtp_decoder->reorder_buf = malloc(RTP_REORDER_WINDOW * RTP_REORDER_PACKET_CAPACITY);
++      if (!rtp_decoder->nalu_buf || !rtp_decoder->au_buf || !rtp_decoder->reorder_buf) {
++        LOGE("RTP H265: failed to allocate decoder buffers");
++        free(rtp_decoder->nalu_buf);
++        free(rtp_decoder->au_buf);
++        free(rtp_decoder->reorder_buf);
++        rtp_decoder->nalu_buf = NULL;
++        rtp_decoder->au_buf = NULL;
++        rtp_decoder->reorder_buf = NULL;
++        rtp_decoder->nalu_capacity = 0;
++        rtp_decoder->au_capacity = 0;
++        break;
++      }
++      // The default is the payload type this build advertises.  The peer
++      // numbers the H.265 stream in ITS offer, so the owner of the
++      // connection has to hand the real number over (see
++      // peer_connection_set_video_h265_payload_type()).
++      rtp_decoder->h265_payload_type = PT_H265;
++      rtp_decoder->decode_func = rtp_decode_video;
++      break;
+     case CODEC_PCMA:
+       rtp_decoder->type = PT_PCMA;
+       rtp_decoder->decode_func = rtp_decode_generic;
+@@ -755,7 +1191,7 @@ static void rtp_decoder_expire_gap(RtpDecoder* rtp_decoder, uint32_t now_ms) {
+ }
+
+ void rtp_decoder_poll(RtpDecoder* rtp_decoder) {
+-  if (rtp_decoder && rtp_decoder->type == PT_H264)
++  if (rtp_decoder && (rtp_decoder->type == PT_H264 || rtp_decoder->type == PT_H265))
+     rtp_decoder_expire_gap(rtp_decoder, ports_get_epoch_time());
+ }
+
+@@ -818,7 +1254,7 @@ int rtp_decoder_decode(RtpDecoder* rtp_decoder, const uint8_t* buf, size_t size)
+   if (rtp_decoder->decode_func == NULL)
+     return -1;
+
+-  if (rtp_decoder->type == PT_H264)
++  if (rtp_decoder->type == PT_H264 || rtp_decoder->type == PT_H265)
+     return rtp_decoder_decode_reordered(rtp_decoder, buf, size);
+
+   return rtp_decoder->decode_func(rtp_decoder, (uint8_t*)buf, size);
+diff --git a/src/rtp.h b/src/rtp.h
+index 920bf37..c8e7c99 100644
+--- a/src/rtp.h
++++ b/src/rtp.h
+@@ -26,6 +26,7 @@ typedef enum RtpPayloadType {
+   PT_PCMA = 8,
+   PT_G722 = 9,
+   PT_H264 = 96,
++  PT_H265 = 97,
+   PT_OPUS = 111
+
+ } RtpPayloadType;
+@@ -127,6 +128,26 @@ struct RtpDecoder {
+   uint32_t single_packets;
+   uint32_t stap_packets;
+   uint32_t fu_packets;
++  // H.265 (RFC 7798) state.  The payload type of the H.265 stream is NOT
++  // fixed: the peer numbers it in the offer and the answer has to use the
++  // very same number, so the owner of the connection hands it over.
++  // h265_payload_type == 0 means "unknown" -> every video packet is treated
++  // as H.264 (the historical behaviour).
++  uint8_t h265_payload_type;
++  // RFC 7798 section 4.4.3: the 16 bit DONL field is only present when the
++  // SDP says sprop-max-don-diff > 0 (and, for an FU, only in the first
++  // fragment).  The cloud does not use it, but the decoder supports it.
++  uint8_t h265_has_donl;
++  uint8_t au_has_vps;
++  uint8_t cached_vps[64];
++  size_t cached_vps_size;
++  uint8_t cached_sps_h265[512];
++  size_t cached_sps_h265_size;
++  uint8_t cached_pps_h265[64];
++  size_t cached_pps_h265_size;
++  uint32_t h265_single_packets;
++  uint32_t h265_ap_packets;
++  uint32_t h265_fu_packets;
+   uint8_t* reorder_buf;
+   size_t reorder_sizes[RTP_REORDER_WINDOW];
+   uint16_t reorder_sequences[RTP_REORDER_WINDOW];
+diff --git a/src/sdp.c b/src/sdp.c
+index 01cbd1f..e2d529e 100644
+--- a/src/sdp.c
++++ b/src/sdp.c
+@@ -40,6 +40,23 @@ void sdp_append_h264(char* sdp) {
+   sdp_append(sdp, "a=rtcp-mux");
+ }
+
++void sdp_append_h264_h265(char* sdp) {
++  sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF 96 97");
++  sdp_append(sdp, "c=IN IP4 0.0.0.0");
++  sdp_append(sdp, "a=rtcp-fb:96 nack");
++  sdp_append(sdp, "a=rtcp-fb:96 nack pli");
++  sdp_append(sdp, "a=rtcp-fb:97 nack");
++  sdp_append(sdp, "a=rtcp-fb:97 nack pli");
++  sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
++  sdp_append(sdp, "a=fmtp:97 level-id=120;profile-id=1;profile-space=0;tier-flag=0");
++  sdp_append(sdp, "a=rtpmap:96 H264/90000");
++  sdp_append(sdp, "a=rtpmap:97 H265/90000");
++  sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");
++  sdp_append(sdp, "a=sendrecv");
++  sdp_append(sdp, "a=mid:video");
++  sdp_append(sdp, "a=rtcp-mux");
++}
++
+ void sdp_append_pcma(char* sdp) {
+   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 8");
+   sdp_append(sdp, "c=IN IP4 0.0.0.0");
+diff --git a/src/sdp.h b/src/sdp.h
+index ba85d71..8f5c971 100644
+--- a/src/sdp.h
++++ b/src/sdp.h
+@@ -12,6 +12,17 @@
+
+ void sdp_append_h264(char* sdp);
+
++/**
++ * Advertise H.264 AND H.265 in the same video section.
++ *
++ * The answerer may answer with a payload type list that is a subset of the
++ * offer's (RFC 3264 section 6.1).  Offering both codecs keeps the
++ * connection usable when one of the two is dropped later on (the peer may
++ * remove the H.265 payload types from the answer), while the RTP payload
++ * type tells the depacketizer which codec actually arrives.
++ */
++void sdp_append_h264_h265(char* sdp);
++
+ void sdp_append_pcma(char* sdp);
+
+ void sdp_append_pcmu(char* sdp);

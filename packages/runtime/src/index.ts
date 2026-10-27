@@ -270,6 +270,9 @@ export type * from './audio/dynamics-compressor-node';
 import './audio/audio-destination-node';
 export type * from './audio/audio-destination-node';
 
+import './opus';
+export type * from './opus';
+
 import './audio/base-audio-context';
 export type * from './audio/base-audio-context';
 
@@ -291,9 +294,32 @@ import './video';
 
 export type * from './video';
 
+// Native WebRTC binding (libpeer backend). Installs globalThis.__nx_webrtc
+// and globalThis.__nx_webrtc_peer_factory. See native-webrtc.ts.
+import './native-webrtc';
+
+export type * from './native-webrtc';
+
 import './window';
 
 export type * from './window';
+
+// facade (patches/0009-facade-injection.patch): 把 W3C 外壳
+// （RTCPeerConnection / RTCDataChannel / MediaStreamTrack / navigator.mediaDevices …）
+// 装到 globalThis。
+//
+// ⚠️ 位置是硬约束：runtime bundle 在**任何页面脚本之前**求值
+// （source/main.cc:2264 的 run_script(runtime.js)，之后才是 :2294 的
+// nx_run_entry_module(user_code)）→ 米哈游 SDK（cg-sdk.js）加载时 facade
+// 已经装好 → 它的 CompatibilityChecker 探测得到 RTCPeerConnection → 门禁能过。
+// 装晚了 = SDK 判定「浏览器不支持」→ 直接黑屏（docs/08 §4.5 S2）。
+//
+// 放在 './window' 之后：window === globalThis（window.ts:31），
+// 装在 globalThis 上 = 页面看到的 window.RTCPeerConnection。
+//
+// ⚠️ 这里只是 **re-export**（facade.ts 里 `export { installEngineFacade } from ...`），
+// 真正安装由本文件**模块体末尾**的显式调用完成 —— 见文件末尾的注释。
+import { installEngineFacade } from './facade';
 
 import './performance';
 
@@ -385,6 +411,10 @@ export type {
 	WebSocket,
 } from './websocket';
 
+import './webcodecs';
+
+export type * from './webcodecs';
+
 import { dispatchKeyboardEvents } from './keyboard';
 import { dispatchTouchEvents } from './touchscreen';
 import { sweepGamepadConnections } from './navigator/gamepad';
@@ -442,3 +472,10 @@ $.onFrame((plusDown) => {
 $.onExit(() => {
 	dispatchEvent(new Event('unload'));
 });
+
+// facade 装到 globalThis。
+// ⚠️ 必须在**模块体**里显式调用（不能靠 import 的模块顶层副作用）：
+// 静态 import 会被提升到模块体之前求值，那时 setTimeout / Switch 还没 def 到
+// globalThis 上 → 引擎启动即 ReferenceError（真机实测 2026-10-21）。
+// 时序硬约束：这里仍早于任何页面脚本（docs/08 §4.5 S2）。
+installEngineFacade();

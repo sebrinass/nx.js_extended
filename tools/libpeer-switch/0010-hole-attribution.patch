@@ -1,0 +1,150 @@
+RTP reassembly: charge a lost packet to ONE frame instead of two.
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place: the next `git submodule update` would throw the changes away.  This
+patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it is
+the tenth patch of that series, after 0001-switch-webrtc-fixes,
+0002-no-stdout-log, 0003-h265-depacketizer, 0004-dtls-diagnostics,
+0005-ice-roles-prflx-and-timing, 0006-dtls-fingerprint-and-verify,
+0007-ice-timeout-and-verify-none, 0008-dtls-bio-remb-and-candidate-dedup and
+0009-sctp-init-and-diagnostics).
+
+*** READ THIS FIRST: this patch is NOT the fix for the 2026-10-23 failure ***
+----------------------------------------------------------------------------
+
+The failure in question ("0 key frames, 0 decoded frames, 2261 access units
+delivered, 69 bytes per unit on average") was NOT caused by the reassembler:
+
+  * the device report says packetsLost = 0, and packetsLost IS
+    vstats.sequence_gaps (engine/source/webrtc_backend_libpeer.cc) -- so the
+    session had ZERO sequence gaps;
+  * the access unit rate was exactly 30.0/s, i.e. not a single frame was
+    missing either.
+
+=> the chain "a hole => the access unit is damaged => the whole frame is
+dropped" NEVER FIRED in that run.  This patch is kept because it is a real
+(but different) bug, not because it explains the failure.
+
+What
+---
+
+  * ONE lost packet costs ONE frame, not two.
+
+    The old code charged a hole to the access unit TWICE: once where the
+    hole is detected (right: the access unit that is open NOW is the one
+    that contains the hole) and once again AFTER
+    rtp_decoder_begin_access_unit() (wrong: by then that access unit has
+    been flushed and the NEXT frame has started -- and the next frame is
+    complete).  The second, unconditional assignment is GONE now, in the
+    H.264 path and in the H.265 path.
+
+  * The two paths are TEXTUALLY IDENTICAL.
+
+    The H.264 and the H.265 gap handling were compared side by side
+    (rtp_decode_h264() and rtp_decode_h265()): both were
+    "if (sequence_gap) { sequence_gaps++; au_damaged = 1; ... }" plus the
+    same second unconditional assignment -- i.e. they behaved IDENTICALLY,
+    so there was no behavioural asymmetry to fix (the claim that the H.264
+    path was "unconditional" while the H.265 path was "conditional" does
+    not hold for this tree: both assignments sit inside "if (sequence_gap)").
+    The two blocks now carry the SAME comment, so they cannot drift apart
+    again -- and the next reader does not have to re-derive that.
+
+What this patch deliberately does NOT do any more
+---------------------------------------------------
+
+  An earlier version of this patch ALSO
+
+    * replaced the flat 30 ms gap hold with an RTT driven one
+      (2 x RTT + 20 ms, clamped to 30..400 ms) and
+    * grew the reorder window from 128 to 512 slots (and the hold limit
+      from 64 to 256 packets).
+
+  Both were removed on purpose:
+
+    * they were never triggered: the session had no sequence gap at all;
+    * the window costs 8x the memory (256 KB -> 1 MB per peer) and the
+      hold pushes the latency to 300 ms;
+    * our own discipline is "one variable per round": with the PLI trigger
+      (0011) and the codec fix (enableWrappedH265) in flight, a third
+      change in the reassembler would make the next device report
+      unreadable ("was it the PLI? was it the codec? was it the window?").
+
+  => struct RtpDecoder keeps its ORIGINAL LAYOUT: this patch adds NO field
+  and changes NO constant.  (0011 adds four counters to it -- that one DOES
+  change the layout, so libpeer.a has to be rebuilt for 0011, not for this
+  patch.)
+
+How the criterion changes (AGENTS.md 6.2, rule 8)
+---------------------------------------------------
+
+  * a session WITH a hole: one lost packet used to cost two frames, now it
+    costs one -- access_units_dropped drops by one per hole;
+  * a session WITHOUT a hole (the 2026-10-23 run): NOTHING changes.  That
+    is the point: this patch must not be able to change the next report
+    except through the counters that belong to the PLI work.
+
+A host-side self test of the rule itself (and of the source invariants this
+patch establishes) is next to this file:
+tools/libpeer-switch/0010-hole-attribution-check.mjs
+diff --git a/src/rtp.c b/src/rtp.c
+index 2a82b0f..e96fb73 100644
+--- a/src/rtp.c
++++ b/src/rtp.c
+@@ -537,6 +537,16 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+       (uint16_t)(rtp_decoder->last_seq_number + 1) != view.seq_number;
+   if (sequence_gap) {
+     rtp_decoder->sequence_gaps++;
++    // ★ 0010: the hole is charged to the access unit that is CURRENT when it
++    //   is detected -- and to that ONE only.
++    //
++    //   The old code did it TWICE: once here (right: the access unit that is
++    //   open now is the one that contains the hole) and once again after
++    //   rtp_decoder_begin_access_unit() (wrong: by then the access unit that
++    //   contains the hole has been flushed -- and the NEXT frame has
++    //   started.  That frame is complete and was thrown away for nothing).
++    //
++    //   One lost packet cost TWO frames; now it costs one.
+     rtp_decoder->au_damaged = 1;
+     if (rtp_decoder->fragment_started) {
+       LOGW("RTP H264: sequence gap inside fragmented NALU (%u -> %u)",
+@@ -549,8 +559,8 @@ static int rtp_decode_h264(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+   rtp_decoder->has_last_seq_number = 1;
+   rtp_decoder_begin_access_unit(rtp_decoder, view.timestamp);
+   rtp_decoder->au_ssrc = view.ssrc;
+-  if (sequence_gap)
+-    rtp_decoder->au_damaged = 1;
++  // ★ 0010: the second, unconditional "sequence_gap => au_damaged" is GONE.
++  //   It is the one that killed the frame AFTER the hole.
+ 
+   const uint8_t nalu_type = view.payload[0] & 0x1f;
+ 
+@@ -910,6 +920,16 @@ static int rtp_decode_h265(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+       (uint16_t)(rtp_decoder->last_seq_number + 1) != view.seq_number;
+   if (sequence_gap) {
+     rtp_decoder->sequence_gaps++;
++    // ★ 0010: the hole is charged to the access unit that is CURRENT when it
++    //   is detected -- and to that ONE only.
++    //
++    //   The old code did it TWICE: once here (right: the access unit that is
++    //   open now is the one that contains the hole) and once again after
++    //   rtp_decoder_begin_access_unit() (wrong: by then the access unit that
++    //   contains the hole has been flushed -- and the NEXT frame has
++    //   started.  That frame is complete and was thrown away for nothing).
++    //
++    //   One lost packet cost TWO frames; now it costs one.
+     rtp_decoder->au_damaged = 1;
+     if (rtp_decoder->fragment_started) {
+       LOGW("RTP H265: sequence gap inside fragmented NALU (%u -> %u)",
+@@ -922,8 +942,8 @@ static int rtp_decode_h265(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+   rtp_decoder->has_last_seq_number = 1;
+   rtp_decoder_begin_access_unit(rtp_decoder, view.timestamp);
+   rtp_decoder->au_ssrc = view.ssrc;
+-  if (sequence_gap)
+-    rtp_decoder->au_damaged = 1;
++  // ★ 0010: the second, unconditional "sequence_gap => au_damaged" is GONE.
++  //   It is the one that killed the frame AFTER the hole.
+ 
+   if (view.payload_size < H265_NAL_HEADER_SIZE)
+     return -1;

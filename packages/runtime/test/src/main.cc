@@ -41,6 +41,7 @@
 #include "module.h"
 #include "types.h"
 #include "util.h"
+#include "webrtc.h"
 
 #include "include/core/SkMilestone.h"
 
@@ -333,6 +334,7 @@ static void build_init_object(Isolate *iso, Local<Context> context,
 	nx_init_video(iso, init_obj);
 	nx_init_web(iso, init_obj);
 	nx_init_webgl(iso, init_obj);
+	nx_init_webrtc(iso, init_obj);
 	nx_init_window(iso, init_obj);
 	NX_SET_FUNC(init_obj, "exit", js_exit);
 	NX_SET_FUNC(init_obj, "queueMicrotask", js_queue_microtask);

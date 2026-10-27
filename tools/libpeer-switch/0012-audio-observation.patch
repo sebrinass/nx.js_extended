@@ -1,0 +1,340 @@
+Audio observation for libpeer (extern/libpeer): classify every inbound
+RTP packet and log the classification, so "does the cloud send audio at
+all?" stops being a guess.
+
+extern/libpeer is a git SUBMODULE, so its sources must not be edited in
+place: the next `git submodule update` would throw the changes away.  This
+patch is applied to the checked out tree by
+tools/apply-libpeer-switch-patches.sh, right before libpeer is built (it is
+the twelfth patch of that series, after 0001-switch-webrtc-fixes,
+0002-no-stdout-log, 0003-h265-depacketizer, 0004-dtls-diagnostics,
+0005-ice-roles-prflx-and-timing, 0006-dtls-fingerprint-and-verify,
+0007-ice-timeout-and-verify-none, 0008-dtls-bio-remb-and-candidate-dedup,
+0009-sctp-init-and-diagnostics, 0010-hole-attribution and
+0011-pli-trigger).
+
+Why
+---
+
+The 2026-10-24 capture: our session receives video and 2653 decoded
+frames, but ZERO audio tracks and ZERO audio packets -- while the official
+web client on the same account receives ~40 audio packets per second.
+The breakpoint has narrowed to "the cloud does not send audio packets"
+vs "we drop them", and NOTHING on the libpeer side could tell those
+apart:
+
+  * rtp_decode_generic() (src/rtp.c) has no packet counters at all --
+    only the H.264 path counts anything;
+  * the receive path classifies packets (audio SSRC / video SSRC / PT
+    sniffing) but only counts the classes it likes -- a packet that
+    matched NEITHER stream was dropped silently.
+
+What
+---
+
+  * Four counters on PeerConnection, bumped exactly where the streams
+    are told apart (the is_audio_payload + SSRC site that already
+    exists -- no separate payload-type table is introduced):
+
+      rtp_packets_total      audio + video + unmatched
+      rtp_audio_packets      matched the audio stream (SSRC or audio PT;
+                             PT 63 = RED counts as audio, like the site
+                             always did)
+      rtp_video_packets      matched the video stream
+      rtp_unmatched_packets  matched NEITHER (the old silent drop)
+
+    plus rtp_learned_audio_ssrc: the SSRC the PT-sniffing learned, set
+    at the moment it learns (kept distinct from remote_assrc, which may
+    also come from the SDP; 0 = the sniffing never fired).
+
+  * One diagnostic line every 5 s (PEER_RTP_CLASS_DIAG_INTERVAL_MS):
+
+      udp_class=rtp audio=%u video=%u unmatched=%u total=%u audioSsrc=%u
+
+    Time-based on purpose: the line must keep printing when there is
+    nothing to report.  The engine-side whitelist (patch 0035) needs the
+    key "udp_class=rtp" for this line to reach nxjs-debug.log; the
+    learning moment already logs "learned_audio_ssrc=... pt=..."
+    (key "learned_audio_ssrc").
+
+  * RED (RFC 2198) is NOT unwrapped here, deliberately.  The question
+    this patch answers is "do audio packets arrive at all"; PT 63 is
+    classified as audio either way, and the unwrapping already exists on
+    the app side (apps/audioprobe/opus-format.js, with tests) for the
+    day the answer is "yes" and the payload itself matters.
+
+  * Task B extension: the chain AFTER arrival, one step deeper.  The
+    classification above says a packet matched the audio stream; it says
+    nothing about whether anything came out of it.  rtp_decode_generic()
+    (src/rtp.c) kept no books at all, so "arrived but not depacketized"
+    and "depacketized but not consumed" were indistinguishable.  It now
+    counts, on RtpDecoder (the audio instance is artp_decoder):
+
+      audio_packets_parsed   rtp_parse_payload() accepted the packet;
+      audio_units_produced   the audio callback really fired;
+      audio_fail_short       parse failed: shorter than an RTP header;
+      audio_fail_shape       parse failed: the CSRC / extension /
+                             padding / version family;
+      audio_red_packets      parse OK and PT 63 (RED) -- now visibly
+                             "not unwrapped here" instead of silent;
+      audio_opus_packets     parse OK and PT 111 (OPUS).
+
+    A second line rides the same prefix (no new whitelist key):
+
+      udp_class=rtp audioChain recv=.. parsed=.. produced=..
+                           failShort=.. failShape=.. redPt=.. opusPt=..
+
+    Honest layer boundary: "opus parameters wrong" is NOT observable
+    here (libpeer does not parse opus) -- that verdict belongs to the
+    engine's decoder error line one layer up.
+
+How the criterion changes (AGENTS.md 6.2, rule 8)
+---------------------------------------------------
+
+  * fault present (no audio sent): audio=0 while total (and video) grow;
+  * audio sent but dropped by us: audio>0 with no sound in the app --
+    the search moves to OUR decode path;
+  * unexpected stream: unmatched>0 -- the cloud sending on an SSRC we
+    never negotiated;
+  * task B, arrived-but-not-depacketized: recv > parsed on the
+    audioChain line (failShort / failShape say which shape is wrong);
+  * task B, depacketized-but-not-consumed: parsed > produced (no audio
+    callback registered);
+  * task B, RED-only sender: redPt > 0 with opusPt == 0 -- the payload
+    needs RFC 2198 unwrapping that nobody does on this side.
+
+Every one of them moves, so the line is a criterion and not a
+decoration.
+
+A host-side self test of the rule itself is next to this file:
+tools/libpeer-switch/0012-audio-observation-check.mjs
+
+Note for the Switch build
+-------------------------
+
+struct PeerConnection is PRIVATE to src/peer_connection.c (it is not in
+an installed header), so appending fields moves no ABI: the engine never
+allocates it by layout.  struct RtpDecoder DOES live in the installed
+src/rtp.h and gains six fields at its END (after pli_last_sent_ms) --
+same rule as 0011: libpeer.a has to be rebuilt and the installed headers
+refreshed together with the engine, otherwise the engine and libpeer
+disagree about the struct layout (silent memory corruption, not a clean
+compile error).
+
+diff --git a/src/peer_connection.c b/src/peer_connection.c
+index 37ce186..a644be7 100644
+--- a/src/peer_connection.c
++++ b/src/peer_connection.c
+@@ -180,6 +180,12 @@
+ // 0011: how often the PLI state is written to the diagnostic log (ms).
+ #define PEER_PLI_DIAG_INTERVAL_MS 2000
+ 
++// 0012: how often the RTP classification is written to the diagnostic
++// log (ms).  Time-based on purpose: the line must keep printing when
++// there is nothing to report -- "audio=0 while total grows" is exactly
++// the finding it exists for.
++#define PEER_RTP_CLASS_DIAG_INTERVAL_MS 5000
++
+ struct PeerConnection {
+   PeerConfiguration config;
+   PeerConnectionState state;
+@@ -305,6 +311,25 @@ struct PeerConnection {
+   uint32_t remb_stress_total;
+   uint32_t remb_last_measured_bps;
+   uint32_t remb_state_diag_ms;
++  // 0012: the RTP classification counters.  "Does the cloud send audio
++  // at all?" is a question the video-only path could never answer -- the
++  // audio decoder got no packets, so no counter anywhere ever moved.
++  //
++  //   rtp_packets_total      every RTP packet that reached classification
++  //                          (== audio + video + unmatched)
++  //   rtp_audio_packets      matched the audio stream (SSRC or audio PT)
++  //   rtp_video_packets      matched the video stream
++  //   rtp_unmatched_packets  matched NEITHER -- the silent drops
++  //   rtp_learned_audio_ssrc the SSRC the PT-sniffing learned (0 = it
++  //                          never fired; remote_assrc may still have
++  //                          come from the SDP)
++  //   rtp_class_last_log_ms  wall clock of the last classification line
++  uint32_t rtp_packets_total;
++  uint32_t rtp_audio_packets;
++  uint32_t rtp_video_packets;
++  uint32_t rtp_unmatched_packets;
++  uint32_t rtp_learned_audio_ssrc;
++  uint32_t rtp_class_last_log_ms;
+ };
+ 
+ static int peer_connection_send_rtcp_nack(PeerConnection* pc, uint32_t ssrc,
+@@ -502,6 +527,41 @@ static void peer_connection_log_pli_state(PeerConnection* pc) {
+       pli_ago);
+ }
+ 
++// 0012: the RTP classification in the diagnostic log.  This is the line
++// that answers "does the cloud send audio at all?" on the device:
++//   audio=0 while total grows  -> the sender is not sending audio;
++//   audio>0 with no sound      -> the loss is on OUR side of the decoder.
++static void peer_connection_log_rtp_class(PeerConnection* pc) {
++  if (!pc)
++    return;
++  const uint32_t now_ms = ports_get_epoch_time();
++  if (pc->rtp_class_last_log_ms != 0 &&
++      (uint32_t)(now_ms - pc->rtp_class_last_log_ms) < PEER_RTP_CLASS_DIAG_INTERVAL_MS)
++    return;
++  pc->rtp_class_last_log_ms = now_ms;
++  peer_connection_diag_log("udp_class=rtp audio=%u video=%u unmatched=%u total=%u audioSsrc=%u",
++                           pc->rtp_audio_packets,
++                           pc->rtp_video_packets,
++                           pc->rtp_unmatched_packets,
++                           pc->rtp_packets_total,
++                           pc->rtp_learned_audio_ssrc);
++  // 0012/B (task B): the audio chain one step deeper than the counters
++  // above -- received (classified) vs parsed (payload extracted by
++  // rtp_parse_payload) vs produced (handed to the audio callback).
++  //   recv > parsed  == parse failures (failShort / failShape say which);
++  //   parsed > produced == no audio callback registered;
++  //   redPt > 0 with opusPt == 0 == the sender speaks RED only, and
++  //   nobody unwraps it on this side (see the patch prose).
++  peer_connection_diag_log("udp_class=rtp audioChain recv=%u parsed=%u produced=%u failShort=%u failShape=%u redPt=%u opusPt=%u",
++                           pc->rtp_audio_packets,
++                           pc->artp_decoder.audio_packets_parsed,
++                           pc->artp_decoder.audio_units_produced,
++                           pc->artp_decoder.audio_fail_short,
++                           pc->artp_decoder.audio_fail_shape,
++                           pc->artp_decoder.audio_red_packets,
++                           pc->artp_decoder.audio_opus_packets);
++}
++
+ static void peer_connection_maybe_send_video_nacks(PeerConnection* pc,
+                                                    uint16_t newest_sequence) {
+   RtpDecoder* decoder = &pc->vrtp_decoder;
+@@ -1573,9 +1633,21 @@ int peer_connection_loop(PeerConnection* pc) {
+                                        rtp->header.type == PT_PCMA ||
+                                        rtp->header.type == PT_OPUS ||
+                                        rtp->header.type == 63;
++          // 0012: classify EVERY RTP packet right where the streams are
++          // told apart -- "does the cloud send audio at all?" is answered
++          // by these counters, not by the decoder (rtp_decode_generic()
++          // keeps no counters of its own).  The audio/video decision is
++          // the one this site already makes (is_audio_payload + the two
++          // SSRCs); no separate payload-type table is introduced here.
++          pc->rtp_packets_total++;
+           if (ssrc == pc->remote_assrc || (pc->remote_assrc == 0 && is_audio_payload)) {
++            pc->rtp_audio_packets++;
+             if (pc->remote_assrc == 0) {
+               pc->remote_assrc = ssrc;
++              // 0012: remember the SSRC the PT-sniffing learned -- kept
++              // distinct from remote_assrc, which may also come from the
++              // SDP; 0 here means the sniffing never fired.
++              pc->rtp_learned_audio_ssrc = ssrc;
+               LOGI("Learned remote audio SSRC from RTP: %" PRIu32, pc->remote_assrc);
+               peer_connection_diag_log("learned_audio_ssrc=%" PRIu32 " pt=%u",
+                                        pc->remote_assrc, rtp->header.type);
+@@ -1587,6 +1659,7 @@ int peer_connection_loop(PeerConnection* pc) {
+                       rtp->header.type != PT_PCMA &&
+                       rtp->header.type != PT_OPUS &&
+                       rtp->header.type != 63)) {
++            pc->rtp_video_packets++;
+             if (pc->remote_vssrc == 0) {
+               pc->remote_vssrc = ssrc;
+               LOGI("Learned remote video SSRC from RTP: %" PRIu32, pc->remote_vssrc);
+@@ -1624,6 +1697,12 @@ int peer_connection_loop(PeerConnection* pc) {
+                   pc->vrtp_decoder.keyframes_received,
+                   pc->vrtp_decoder.pli_sent);
+             }
++          } else {
++            // 0012: RTP that matched NEITHER stream.  The old code dropped
++            // it silently; now it is counted, because "packets that belong
++            // to no stream" is its own failure mode (e.g. the cloud
++            // sending on an SSRC we never negotiated).
++            pc->rtp_unmatched_packets++;
+           }
+ 
+         } else {
+@@ -1676,6 +1755,8 @@ int peer_connection_loop(PeerConnection* pc) {
+       //   most one PLI per loop tick (12 bytes; the cost is negligible).
+       peer_connection_maybe_send_pli(pc);
+       peer_connection_log_pli_state(pc);
++      // 0012: the audio observation line (see peer_connection_log_rtp_class()).
++      peer_connection_log_rtp_class(pc);
+ 
+       break;
+     case PEER_CONNECTION_FAILED:
+diff --git a/src/rtp.c b/src/rtp.c
+index d7a2942..4071fe3 100644
+--- a/src/rtp.c
++++ b/src/rtp.c
+@@ -1044,8 +1044,30 @@ static int rtp_decode_video(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size)
+ 
+ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size) {
+   RtpPayloadView view;
+-  if (rtp_parse_payload(buf, size, &view) != 0)
++  if (rtp_parse_payload(buf, size, &view) != 0) {
++    // 0012/B: say WHY nothing was produced.  rtp_parse_payload() itself
++    // only answers "no"; the short-vs-shape split is re-derived here
++    // (the raw shape is still in buf).
++    if (size < 12) {
++      rtp_decoder->audio_fail_short++;
++    } else {
++      rtp_decoder->audio_fail_shape++;
++    }
+     return -1;
++  }
++
++  rtp_decoder->audio_packets_parsed++;
++  if (buf != NULL) {
++    const uint8_t pt = ((RtpHeader*)buf)->type;
++    if (pt == 63) {
++      // 0012/B: RED (RFC 2198) is not unwrapped on this side; counting it
++      // separately makes "the sender speaks RED only" visible instead of
++      // silent.
++      rtp_decoder->audio_red_packets++;
++    } else if (pt == PT_OPUS) {
++      rtp_decoder->audio_opus_packets++;
++    }
++  }
+ 
+   if (rtp_decoder->on_audio_packet != NULL) {
+     PeerAudioPacket packet = {
+@@ -1058,6 +1080,9 @@ static int rtp_decode_generic(RtpDecoder* rtp_decoder, uint8_t* buf, size_t size
+       .marker = view.marker,
+     };
+     rtp_decoder->on_audio_packet(&packet, rtp_decoder->user_data);
++    // 0012/B: "produced" is the callback really firing -- the difference
++    // parsed-minus-produced is the "no consumer registered" verdict.
++    rtp_decoder->audio_units_produced++;
+   } else if (rtp_decoder->on_packet != NULL)
+     rtp_decoder->on_packet(view.payload, view.payload_size, rtp_decoder->user_data);
+   // even if there is no callback set, assume everything is ok for caller and do not return an error
+diff --git a/src/rtp.h b/src/rtp.h
+index 8c5eecb..87569b4 100644
+--- a/src/rtp.h
++++ b/src/rtp.h
+@@ -192,6 +192,29 @@ struct RtpDecoder {
+   uint32_t last_keyframe_ms;
+   uint32_t pli_sent;
+   uint32_t pli_last_sent_ms;
++  // 0012/B: the audio chain counters.  "received" lives on the owner
++  // (PeerConnection, classified where the streams are told apart);
++  // these start one step deeper:
++  //   audio_packets_parsed  rtp_parse_payload() accepted the packet
++  //                         (a payload was extracted);
++  //   audio_units_produced  the audio callback really fired (a payload
++  //                         was handed upward);
++  //   audio_fail_short      parse failed: the packet is shorter than an
++  //                         RTP header;
++  //   audio_fail_shape      parse failed: the CSRC / extension / padding
++  //                         / version family ("the shape is wrong");
++  //   audio_red_packets     parse OK and payload type 63 (RED, RFC 2198)
++  //                         -- NOT unwrapped here, but visibly so;
++  //   audio_opus_packets    parse OK and payload type 111 (OPUS).
++  // Note: "opus parameters wrong" is NOT observable at this layer
++  // (libpeer does not parse opus); that verdict belongs to the engine's
++  // decoder error line one layer up.
++  uint32_t audio_packets_parsed;
++  uint32_t audio_units_produced;
++  uint32_t audio_fail_short;
++  uint32_t audio_fail_shape;
++  uint32_t audio_red_packets;
++  uint32_t audio_opus_packets;
+ };
+ 
+ struct RtpEncoder {

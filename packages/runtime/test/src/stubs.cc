@@ -15,6 +15,11 @@
  * memory.cc is Switch-specific (svc memory introspection), so it is stubbed
  * here too. (audio.cc is portable because the platform output lives behind
  * audio-sink.h — the host sink is src/audio-sink.cc.)
+ *
+ * webrtc is NOT stubbed: source/webrtc.cc (the V8 half) is portable and is
+ * compiled into the host binary; only its backend is device-only, and that
+ * is faked by src/webrtc-backend-stub.cc. See the webrtc note in
+ * src/compat/switch.h.
  */
 #include "types.h"
 #include <v8.h>
